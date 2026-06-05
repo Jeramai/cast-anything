@@ -3,20 +3,44 @@
   "version": "1.0.0",
   "main": "index.ts",
   "dependencies": {
+    "@dr.pogodin/react-native-fs": "^2.38.2",
+    "@dr.pogodin/react-native-static-server": "^0.26.2",
+    "buffer": "^6.0.3",
     "expo": "~56.0.8",
+    "expo-build-properties": "~56.0.16",
+    "expo-document-picker": "~56.0.4",
+    "expo-file-system": "~56.0.7",
+    "expo-network": "~56.0.4",
     "expo-status-bar": "~56.0.4",
+    "expo-system-ui": "~56.0.5",
+    "fast-xml-parser": "^5.8.0",
     "react": "19.2.3",
-    "react-native": "0.85.3"
+    "react-native": "0.85.3",
+    "react-native-safe-area-context": "~5.7.0",
+    "react-native-tcp-socket": "^6.4.1",
+    "react-native-udp": "^4.1.7"
   },
   "devDependencies": {
     "@types/react": "~19.2.2",
     "typescript": "~6.0.3"
   },
   "scripts": {
-    "start": "expo start",
-    "android": "expo start --android",
-    "ios": "expo start --ios",
-    "web": "expo start --web"
+    "start": "expo start --dev-client",
+    "android": "expo run:android",
+    "ios": "expo run:ios",
+    "prebuild": "expo prebuild --clean",
+    "typecheck": "tsc --noEmit"
   },
-  "private": true
+  "private": true,
+  "expo": {
+    "doctor": {
+      "reactNativeDirectoryCheck": {
+        "exclude": [
+          "react-native-udp",
+          "react-native-tcp-socket"
+        ],
+        "listUnknownPackages": false
+      }
+    }
+  }
 }
