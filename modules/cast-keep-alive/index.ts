@@ -8,13 +8,6 @@ import type {
 export * from './src/CastKeepAlive.types';
 
 /**
- * True when the native foreground-service / background-task module is present in
- * the running binary. It's false until the app is rebuilt with this module, so
- * callers can fall back gracefully.
- */
-export const isBackgroundKeepAliveAvailable = CastKeepAlive != null;
-
-/**
  * Start (or update) the playback notification + keep the app alive while
  * casting. Safe to call repeatedly — the native side starts the foreground
  * service on the first call and just updates the notification after that.

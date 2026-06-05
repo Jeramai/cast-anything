@@ -2,7 +2,6 @@ import TcpSocket from 'react-native-tcp-socket';
 import { Buffer } from 'buffer';
 import {
   buildPacket,
-  decodeLauncherUrl,
   INPUT_URL_LAUNCHER,
   MDC_CMD,
   parseResponse,
@@ -19,14 +18,8 @@ import {
  * push: set the URL Launcher address and switch the input source to it.
  */
 
-// Re-export the public protocol API so existing imports (`../mdc/mdc`) keep working.
-export {
-  MDC_CMD,
-  INPUT_URL_LAUNCHER,
-  PLAY_VIA_URL_LAUNCHER,
-  decodeLauncherUrl,
-  type MdcResponse,
-};
+// Re-export the launcher constants used by the signage flow.
+export { INPUT_URL_LAUNCHER, PLAY_VIA_URL_LAUNCHER };
 
 const MDC_PORT = 1515;
 const DEFAULT_ID = 0x00;
@@ -83,64 +76,15 @@ function sendCommand(
   });
 }
 
-export function getStatus(host: string): Promise<MdcResponse> {
-  return sendCommand(host, MDC_CMD.STATUS);
-}
-
-/** True if the host answers MDC at all (used to detect controllable panels). */
-export async function isMdcReachable(host: string): Promise<boolean> {
-  try {
-    return (await getStatus(host)).ok;
-  } catch {
-    return false;
-  }
-}
-
-export function getInputSource(host: string): Promise<MdcResponse> {
-  return sendCommand(host, MDC_CMD.INPUT_SOURCE);
-}
-
 export function setInputSource(host: string, source: number): Promise<MdcResponse> {
   return sendCommand(host, MDC_CMD.INPUT_SOURCE, [source]);
-}
-
-export function getPlayVia(host: string): Promise<MdcResponse> {
-  return sendCommand(host, MDC_CMD.LAUNCHER, [SUB_PLAY_VIA]);
 }
 
 export function setPlayVia(host: string, mode: number): Promise<MdcResponse> {
   return sendCommand(host, MDC_CMD.LAUNCHER, [SUB_PLAY_VIA, mode]);
 }
 
-export function getLauncherUrl(host: string): Promise<MdcResponse> {
-  return sendCommand(host, MDC_CMD.LAUNCHER, [SUB_URL_ADDRESS]);
-}
-
 export function setLauncherUrl(host: string, url: string): Promise<MdcResponse> {
   const bytes = Array.from(Buffer.from(url, 'ascii'));
   return sendCommand(host, MDC_CMD.LAUNCHER, [SUB_URL_ADDRESS, ...bytes]);
-}
-
-export interface SignageCapabilities {
-  reachable: boolean;
-  /** URL Launcher controllable over MDC (0xC7 ACKs). */
-  urlLauncherSupported: boolean;
-  /** Current launcher URL, if readable. */
-  currentLauncherUrl?: string;
-}
-
-/** Probe what a Samsung panel supports so the app can choose a cast strategy. */
-export async function probeSignage(host: string): Promise<SignageCapabilities> {
-  const reachable = await isMdcReachable(host);
-  if (!reachable) return { reachable: false, urlLauncherSupported: false };
-  try {
-    const urlRes = await getLauncherUrl(host);
-    return {
-      reachable: true,
-      urlLauncherSupported: urlRes.ok,
-      currentLauncherUrl: urlRes.ok ? decodeLauncherUrl(urlRes) : undefined,
-    };
-  } catch {
-    return { reachable: true, urlLauncherSupported: false };
-  }
 }

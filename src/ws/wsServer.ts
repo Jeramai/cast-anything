@@ -149,10 +149,6 @@ export function wsSendControl(action: string, value?: number) {
   for (const c of clients) if (c.open) sendTo(c, { type: 'control', action, value: value ?? null });
 }
 
-export function wsClientCount(): number {
-  return clients.filter((c) => c.open).length;
-}
-
 export function getWsPort(): number {
   return WS_PORT;
 }

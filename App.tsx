@@ -183,7 +183,10 @@ function NowPlayingSheet({
   const EXPANDED = isImage ? 180 : 330;
   const range = EXPANDED - PEEK; // how far it slides down to collapse
 
-  const translateY = useRef(new Animated.Value(range)).current; // start collapsed (peek)
+  // Lazy-init so the Animated.Value isn't reconstructed on every render.
+  const translateYRef = useRef<Animated.Value | null>(null);
+  if (translateYRef.current === null) translateYRef.current = new Animated.Value(range);
+  const translateY = translateYRef.current; // start collapsed (peek)
   const offset = useRef(range);
   const [expanded, setExpanded] = useState(false);
 
@@ -214,8 +217,9 @@ function NowPlayingSheet({
     }).start();
   };
 
-  const pan = useRef(
-    PanResponder.create({
+  const panRef = useRef<ReturnType<typeof PanResponder.create> | null>(null);
+  if (panRef.current === null) {
+    panRef.current = PanResponder.create({
       onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 4,
       onPanResponderMove: (_e, g) => {
         translateY.setValue(Math.min(range, Math.max(0, offset.current + g.dy)));
@@ -230,8 +234,9 @@ function NowPlayingSheet({
         const expand = g.vy < -0.4 || (g.vy <= 0.4 && next < range / 2);
         snapTo(expand ? 0 : range);
       },
-    }),
-  ).current;
+    });
+  }
+  const pan = panRef.current;
 
   return (
     <>
@@ -336,7 +341,8 @@ function CastScreen() {
   const { C, styles, baseKey, accentKey, setBaseKey, setAccentKey } = useTheme();
   const cast = useCast();
   const [urlInput, setUrlInput] = useState("");
-  const [barWidth, setBarWidth] = useState(0);
+  // Only read inside the tap handler (never rendered) → a ref avoids a re-render on layout.
+  const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   const isPlaying = cast.status === "PLAYING";
@@ -494,10 +500,12 @@ function CastScreen() {
                 <Pressable
                   style={styles.progressTrackTappable}
                   hitSlop={{ top: 12, bottom: 12 }}
-                  onLayout={(e) => setBarWidth(e.nativeEvent.layout.width)}
+                  onLayout={(e) => {
+                    barWidthRef.current = e.nativeEvent.layout.width;
+                  }}
                   onPress={(e) => {
-                    if (barWidth > 0) {
-                      const frac = Math.max(0, Math.min(1, e.nativeEvent.locationX / barWidth));
+                    if (barWidthRef.current > 0) {
+                      const frac = Math.max(0, Math.min(1, e.nativeEvent.locationX / barWidthRef.current));
                       cast.signageControls.seekTo(frac * cast.signageControls.duration);
                     }
                   }}
@@ -690,8 +698,15 @@ export default function App() {
     SystemUI.setBackgroundColorAsync(C.bg).catch(() => {});
   }, [C.bg]);
 
+  // Memoize so context consumers don't re-render on unrelated parent renders
+  // (setBaseKey/setAccentKey are stable useState setters).
+  const themeValue = useMemo(
+    () => ({ C, styles, baseKey, accentKey, setBaseKey, setAccentKey }),
+    [C, styles, baseKey, accentKey],
+  );
+
   return (
-    <ThemeContext.Provider value={{ C, styles, baseKey, accentKey, setBaseKey, setAccentKey }}>
+    <ThemeContext.Provider value={themeValue}>
       <SafeAreaProvider>
         <CastScreen />
       </SafeAreaProvider>
@@ -837,11 +852,8 @@ function makeStyles(C: ThemePalette) {
     borderTopLeftRadius: 20,
     borderTopRightRadius: 20,
     // No top border — the scrim + shadow separate it from the content behind.
-    shadowColor: "#000",
-    shadowOffset: { width: 0, height: -4 },
-    shadowOpacity: 0.35,
-    shadowRadius: 12,
-    elevation: 16,
+    // boxShadow works on both platforms on RN's new architecture.
+    boxShadow: "0px -4px 12px rgba(0,0,0,0.35)",
   },
   sheetGrip: { paddingTop: 8, paddingHorizontal: 16 },
   sheetHandle: {

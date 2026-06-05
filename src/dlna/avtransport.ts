@@ -169,7 +169,7 @@ function requireAvTransport(device: DlnaDevice): string {
 }
 
 /** Load a media URL onto the renderer (does not start playback by itself). */
-export async function setAVTransportURI(
+async function setAVTransportURI(
   device: DlnaDevice,
   url: string,
   metadata: string,
@@ -322,7 +322,7 @@ export async function setVolume(
  * Useful when a cast is rejected — e.g. signage panels that advertise the
  * service but don't implement generic DLNA "play to" push.
  */
-export async function inspectDevice(device: DlnaDevice): Promise<void> {
+async function inspectDevice(device: DlnaDevice): Promise<void> {
   console.log('[DLNA] inspecting', device.friendlyName, {
     deviceType: device.deviceType,
     control: device.avTransportControlURL,

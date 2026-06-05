@@ -141,21 +141,6 @@ export async function startFileServer(): Promise<string> {
   }
 }
 
-export async function stopFileServer(): Promise<void> {
-  if (server) {
-    try {
-      await server.stop();
-    } catch {
-      /* ignore */
-    }
-  }
-  server = null;
-  origin = null;
-}
-
-export function getServerOrigin(): string | null {
-  return origin;
-}
 
 // Shown in the on-screen status so you can tell which player a panel is running.
 const PLAYER_VERSION = 9;
