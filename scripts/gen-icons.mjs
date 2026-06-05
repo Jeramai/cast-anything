@@ -19,14 +19,9 @@ function luminance(hex) {
   return 0.2126 * r + 0.7152 * g + 0.0722 * b; // 0..255
 }
 
-// Pale, near-white tile with just a subtle hint of the accent — a crisp square on
-// any wallpaper, but barely tinted so it reads as a clean light tile.
-function tileStops(hex) {
-  return [mix(hex, "#ffffff", 0.97), mix(hex, "#ffffff", 0.92), mix(hex, "#ffffff", 0.84)];
-}
-// Solid pale tile for the Android adaptive backgroundColor (no gradient there).
-function tileSolid(hex) {
-  return mix(hex, "#ffffff", 0.9);
+// Pure white tile — the accent lives entirely in the mark. Clean on any light UI.
+function tileStops(_hex) {
+  return ["#ffffff", "#ffffff", "#ffffff"];
 }
 // Mark gradient: vivid accent for medium/dark accents; darkened for light ones so it
 // keeps contrast against the pale tile.
@@ -92,7 +87,6 @@ for (const a of ACCENTS) {
 }
 console.log(`wrote ${ACCENTS.length} accent variants (opaque + adaptive fg)`);
 
-// Emit the per-accent Android backgroundColors so app.json can be kept in sync.
-const bgColors = Object.fromEntries(ACCENTS.map((a) => [a.key, tileSolid(a.color)]));
-writeFileSync("assets/icons/_bgcolors.json", JSON.stringify({ default: tileSolid(BRAND), accents: bgColors }, null, 2));
-console.log("wrote assets/icons/_bgcolors.json");
+// NOTE: the Android adaptive backgroundColor for every variant is white (#ffffff),
+// set in app.json. If you ever reintroduce a tinted tile, update app.json's
+// android.adaptiveIcon backgroundColor and each per-accent backgroundColor to match.
