@@ -1,8 +1,5 @@
-import {
-  DocumentDirectoryPath,
-  readFile,
-  writeFile,
-} from '@dr.pogodin/react-native-fs';
+// Pure theme data + palette composition — no native imports, so it's unit-testable.
+// Persistence lives in ./themeStore (which pulls in the native filesystem module).
 
 /** The full color palette the UI is built from. */
 export interface ThemePalette {
@@ -87,11 +84,11 @@ export function resolveBaseKey(baseKey: string, systemIsDark: boolean): string {
 }
 
 // ---- Color mixing (for the derived accentDim) ----
-function hexToRgb(h: string): [number, number, number] {
+export function hexToRgb(h: string): [number, number, number] {
   const n = parseInt(h.replace('#', ''), 16);
   return [(n >> 16) & 255, (n >> 8) & 255, n & 255];
 }
-function mix(a: string, b: string, t: number): string {
+export function mix(a: string, b: string, t: number): string {
   const A = hexToRgb(a);
   const B = hexToRgb(b);
   const c = A.map((x, i) => Math.round(x + (B[i] - x) * t));
@@ -119,32 +116,4 @@ export function composePalette(
     // touch of accent, so it's a dark tint on dark bases and a light one on light.
     accentDim: mix(base.card, accent, 0.22),
   };
-}
-
-// ---- Persistence ----
-const FILE = `${DocumentDirectoryPath}/theme.json`;
-
-export interface ThemeChoice {
-  base: string;
-  accent: string;
-}
-
-export async function loadThemeChoice(): Promise<Partial<ThemeChoice>> {
-  try {
-    const parsed = JSON.parse(await readFile(FILE, 'utf8'));
-    return {
-      base: typeof parsed?.base === 'string' ? parsed.base : undefined,
-      accent: typeof parsed?.accent === 'string' ? parsed.accent : undefined,
-    };
-  } catch {
-    return {};
-  }
-}
-
-export async function saveThemeChoice(choice: ThemeChoice): Promise<void> {
-  try {
-    await writeFile(FILE, JSON.stringify(choice), 'utf8');
-  } catch {
-    /* best effort */
-  }
 }

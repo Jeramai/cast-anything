@@ -33,12 +33,11 @@ import {
   composePalette,
   DEFAULT_ACCENT_KEY,
   DEFAULT_BASE_KEY,
-  loadThemeChoice,
   resolveBaseKey,
-  saveThemeChoice,
   SYSTEM_BASE_KEY,
   type ThemePalette,
 } from "./src/theme/themes";
+import { loadThemeChoice, saveThemeChoice } from "./src/theme/themeStore";
 
 // ---- Theme context: the active palette + themed stylesheet ----
 interface ThemeContextValue {

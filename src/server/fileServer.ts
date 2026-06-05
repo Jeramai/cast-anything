@@ -14,6 +14,7 @@ import {
 } from '@dr.pogodin/react-native-fs';
 import * as Network from 'expo-network';
 import { getWsPort } from '../ws/wsServer';
+import { sanitizeFileName } from './sanitize';
 
 /**
  * Serves locally-picked media over HTTP so a TV on the same Wi-Fi can stream it.
@@ -260,12 +261,6 @@ export async function setCurrentMedia(media: {
 }): Promise<void> {
   await ensureShareDir();
   await writeFile(`${SHARE_DIR}/current.json`, JSON.stringify(media), 'utf8');
-}
-
-/** Keep filenames URL/filesystem-safe while preserving the extension. */
-function sanitizeFileName(name: string): string {
-  const cleaned = name.replace(/[^a-zA-Z0-9._-]/g, '_').replace(/_+/g, '_');
-  return cleaned.replace(/^_+|_+$/g, '') || `media-${Date.now()}`;
 }
 
 async function clearShareDir(): Promise<void> {

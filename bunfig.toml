@@ -1,0 +1,4 @@
+[test]
+# Guardrail: `bun test --coverage` fails if covered lines/functions drop below this.
+coverageThreshold = 0.85
+coverageSkipTestFiles = true

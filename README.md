@@ -31,7 +31,8 @@ TV decodes them.
 
 - A **development build** — this app uses native modules (UDP sockets, a native
   HTTP server), so **Expo Go will not work**.
-- Node 18+, the toolchain installed by `npm install`.
+- **[Bun](https://bun.sh)** (the package manager + test runner) and the toolchain
+  installed by `bun install`.
 - **Android:** Android Studio / SDK + a device or emulator. Easiest to test.
 - **iOS:** Xcode + a **real iPhone** (the simulator can't reach the TV reliably),
   **plus the multicast entitlement** — see the iOS section below.
@@ -43,18 +44,49 @@ TV decodes them.
 ## Run it
 
 ```bash
-npm install
+bun install
 
 # Android (device or emulator attached via adb):
-npm run android        # = expo run:android
+bun run android        # = expo run:android
 
 # iOS (real device recommended):
-npm run ios            # = expo run:ios
+bun run ios            # = expo run:ios
 ```
 
 `expo run:*` will prebuild the native project, build a dev client, and launch it.
-After the first build you can just `npm start` (= `expo start --dev-client`) and
+After the first build you can just `bun start` (= `expo start --dev-client`) and
 open the dev client.
+
+## Tests
+
+**`bun test`** — ~108 tests, **~99% line coverage** of the logic. No native mocks:
+either the logic is pure, or its native dependency is a global (`fetch`) that the
+test stubs. To keep it that way, pure logic is split out of native-importing
+modules — e.g. `src/theme/themes.ts` (pure) vs `themeStore.ts` (filesystem),
+`src/mdc/mdcProtocol.ts` (wire format) vs `mdc.ts` (TCP), `ssdpMessage.ts` vs
+`ssdp.ts` (UDP), `wsCodec.ts` vs `wsServer.ts` (sockets).
+
+Covered:
+- **DLNA SOAP** ([avtransport](src/dlna/avtransport.ts)) — request building, UPnP
+  fault parsing, response parsing, and `castMedia`'s 402-retry / Play-701 tolerance
+  (via a stubbed `fetch`).
+- **Device discovery parsing** ([device](src/dlna/device.ts)) — control-URL
+  resolution, Samsung/signage detection, embedded services, error paths.
+- **MDC protocol** — packet framing + checksum, ACK/NAK parsing, URL decode.
+- **SSDP** M-SEARCH build + header parse; **MIME/kind** inference; **theme**
+  composition; **WebSocket** SHA-1 accept-key (RFC 6455 vector) + framing;
+  filename sanitizing; URL parse/resolve/reachability.
+
+```bash
+bun test            # run the suite
+bun run test:coverage  # with coverage (fails under 85% — see bunfig.toml)
+bun run test:watch  # watch mode
+bun run test:types  # type-check the tests (tsconfig.test.json)
+bun run typecheck   # type-check the app
+```
+
+React components/hooks (`App.tsx`, `useCast`) aren't covered here — that needs
+the `jest-expo` native-mock environment, which doesn't pair with `bun test`.
 
 ### iOS multicast entitlement (important)
 
@@ -115,7 +147,7 @@ remote control.) Via the local native module
 
 > **Rebuild required.** This adds native code (`expo-keep-awake` + the local
 > `cast-keep-alive` module), so you must **`npx expo prebuild` and rebuild the
-> dev client** (`npm run android` / `npm run ios`) for it to take effect. The JS
+> dev client** (`bun run android` / `bun run ios`) for it to take effect. The JS
 > degrades gracefully on an older binary — it just no-ops until rebuilt. On
 > Android 13+ the notification needs the **POST_NOTIFICATIONS** permission to be
 > visible; the service (and casting) run either way.
@@ -250,7 +282,7 @@ modules/
 Use [EAS Build](https://docs.expo.dev/build/introduction/):
 
 ```bash
-npm i -g eas-cli
+bun add -g eas-cli
 eas build --profile development --platform android   # or ios
 ```
 
