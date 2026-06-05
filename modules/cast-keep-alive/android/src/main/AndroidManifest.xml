@@ -1,0 +1,16 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+  <!-- Keep the process + Wi-Fi radio alive while serving a local file to the TV. -->
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.WAKE_LOCK" />
+  <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+  <application>
+    <service
+      android:name="expo.modules.castkeepalive.CastKeepAliveService"
+      android:exported="false"
+      android:foregroundServiceType="dataSync" />
+  </application>
+
+</manifest>

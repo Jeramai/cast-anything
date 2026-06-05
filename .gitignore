@@ -39,3 +39,11 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+# local Expo module native build output (the module sources stay tracked)
+modules/**/build/
+modules/**/.cxx/
+modules/**/.gradle/
+
+# personal Claude Code settings (shared settings.json stays tracked)
+.claude/settings.local.json

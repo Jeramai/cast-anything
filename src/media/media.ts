@@ -75,7 +75,11 @@ export function mediaFromUrl(url: string): MediaItem {
 export async function pickMedia(): Promise<MediaItem | null> {
   const result = await DocumentPicker.getDocumentAsync({
     type: ['video/*', 'audio/*', 'image/*'],
-    copyToCacheDirectory: true,
+    // Do NOT let the picker copy the file into our cache — for a multi-GB file
+    // that copy blocks the UI thread (black screen / unresponsive pick). We get
+    // the original location instead (a content:// URI on Android, a file:// temp
+    // on iOS) and copy it ourselves at cast time, off the UI thread.
+    copyToCacheDirectory: false,
     multiple: false,
   });
 

@@ -70,15 +70,19 @@ export function buildDidlMetadata(opts: {
   kind: MediaKind;
   mime: string;
 }): string {
-  // Images aren't seekable streams, so they need different DLNA operation/flag
-  // values than audio/video. Advertising a photo with the streaming/seek flags
-  // (OP=01) makes Samsung reject the item with UPnP 402 (Invalid Args).
-  //   video/audio → OP=01 (byte-seek) + streaming-transfer flags
-  //   image       → OP=00 (no seek)  + interactive/background-transfer flags
+  // DLNA.ORG_OP is two bits: <time-seek><byte-seek>.
+  //   video/audio → OP=11 (BOTH time- and byte-seek). We must advertise
+  //     time-seek (the first 1): the UPnP `Seek` action uses Unit=REL_TIME, and
+  //     Samsung renderers honor exactly what we claim — with OP=01 (byte only)
+  //     they reject every REL_TIME seek with UPnP 701 "Transition not available".
+  //     With OP=11 they accept it and perform a byte-range GET at the computed
+  //     offset, which our Range-capable server handles.
+  //   image → OP=00 (no seek). Advertising a photo with the streaming/seek flags
+  //     makes Samsung reject the item with UPnP 402 (Invalid Args).
   const dlnaFlags =
     opts.kind === 'image'
       ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000'
-      : 'DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+      : 'DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
   const protocolInfo = `http-get:*:${opts.mime}:${dlnaFlags}`;
   return (
     '<DIDL-Lite ' +
@@ -196,10 +200,19 @@ export async function stop(device: DlnaDevice): Promise<void> {
   });
 }
 
-export async function seek(device: DlnaDevice, seconds: number): Promise<void> {
+/**
+ * Seek to an absolute position. `unit` defaults to the standard `REL_TIME`, but
+ * Samsung renderers reject that with 701 and require their proprietary
+ * `X_DLNA_SeekTime` instead (both take an "H:MM:SS" target). See {@link SEEK_UNITS}.
+ */
+export async function seek(
+  device: DlnaDevice,
+  seconds: number,
+  unit: string = 'REL_TIME',
+): Promise<void> {
   await soapAction(requireAvTransport(device), AV_TRANSPORT, 'Seek', {
     InstanceID: '0',
-    Unit: 'REL_TIME',
+    Unit: unit,
     Target: secondsToHms(seconds),
   });
 }
@@ -235,6 +248,54 @@ export async function getPositionInfo(
     position: hmsToSeconds(String(r.RelTime || '')),
     trackURI: String(r.TrackURI || ''),
   };
+}
+
+/** Read the current Master volume (0–100). Returns null if unsupported. */
+export async function getVolume(device: DlnaDevice): Promise<number | null> {
+  if (!device.renderingControlURL) return null;
+  const doc = await soapAction(
+    device.renderingControlURL,
+    RENDERING_CONTROL,
+    'GetVolume',
+    { InstanceID: '0', Channel: 'Master' },
+  );
+  const raw = doc?.Envelope?.Body?.GetVolumeResponse?.CurrentVolume;
+  const n = Number(raw);
+  return Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : null;
+}
+
+/**
+ * Seek to an absolute BYTE offset using Samsung's `X_DLNA_SeekByte` mode. Some
+ * Samsung renderers reject every time-based seek (701) but accept byte seeks —
+ * the offset is derived from the file size and the elapsed-time fraction.
+ */
+export async function seekBytes(
+  device: DlnaDevice,
+  byteOffset: number,
+): Promise<void> {
+  await soapAction(requireAvTransport(device), AV_TRANSPORT, 'Seek', {
+    InstanceID: '0',
+    Unit: 'X_DLNA_SeekByte',
+    Target: String(Math.max(0, Math.floor(byteOffset))),
+  });
+}
+
+/**
+ * Which transport actions the renderer will accept *right now* (comma-separated,
+ * e.g. "Play,Pause,Seek,Stop"). Useful to tell whether a device actually permits
+ * Seek in its current state, vs. just declaring it in its service description.
+ */
+export async function getCurrentTransportActions(
+  device: DlnaDevice,
+): Promise<string> {
+  const doc = await soapAction(
+    requireAvTransport(device),
+    AV_TRANSPORT,
+    'GetCurrentTransportActions',
+    { InstanceID: '0' },
+  );
+  const r = doc?.Envelope?.Body?.GetCurrentTransportActionsResponse ?? {};
+  return String(r.Actions || '');
 }
 
 /** Set volume 0–100 via RenderingControl, if the device advertises it. */
@@ -319,7 +380,18 @@ export async function castMedia(
         throw err;
       }
     }
-    await play(device);
+    try {
+      await play(device);
+    } catch (err) {
+      // Samsung (e.g. The Freestyle) auto-plays on SetAVTransportURI, so an
+      // explicit Play comes back 701 "Transition not available" (it's already
+      // playing). That's success, not a failure — the caller's polling confirms.
+      if (err instanceof Error && /\b701\b/.test(err.message)) {
+        console.warn('[DLNA] Play returned 701 (already auto-playing) — continuing');
+      } else {
+        throw err;
+      }
+    }
   } catch (err) {
     // Log what the device actually supports to aid diagnosis, then rethrow.
     inspectDevice(device).catch(() => {});

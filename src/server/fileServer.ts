@@ -6,7 +6,9 @@ import {
   copyFile,
   exists,
   mkdir,
+  moveFile,
   readDir,
+  stat,
   unlink,
   writeFile,
 } from '@dr.pogodin/react-native-fs';
@@ -275,10 +277,48 @@ async function clearShareDir(): Promise<void> {
   }
 }
 
+// The last file we materialized into SHARE_DIR, so re-casting the same item
+// (e.g. after Stop) doesn't move/copy it again.
+let lastShared: { localUri: string; destPath: string } | null = null;
+
 /**
- * Copy a picked local file into the served directory and return the URL the TV
+ * Materialize the picked source into `destPath`. The picker doesn't copy for us
+ * (so picking a multi-GB file stays instant), so the one unavoidable copy lands
+ * here — at cast time, off the UI thread.
+ *   - `content://` (Android SAF): copy via the resolver; if that can't read it,
+ *     fall back to the resolved underlying file path.
+ *   - `file://` (iOS import temp, or a real path): rename (instant, same volume)
+ *     and fall back to a copy across volumes.
+ */
+async function materialize(localUri: string, destPath: string): Promise<void> {
+  if (localUri.startsWith('content://')) {
+    try {
+      await copyFile(localUri, destPath);
+      return;
+    } catch (e) {
+      const real = (await stat(localUri).catch(() => null))?.originalFilepath;
+      if (real && real !== localUri) {
+        await copyFile(real, destPath);
+        return;
+      }
+      throw new Error(
+        `Couldn't import the picked file for casting (${e instanceof Error ? e.message : String(e)}).`,
+      );
+    }
+  }
+  const fromPath = localUri.replace(/^file:\/\//, '');
+  try {
+    await moveFile(fromPath, destPath); // instant rename when on the same volume
+  } catch {
+    await copyFile(fromPath, destPath);
+  }
+}
+
+/**
+ * Place a picked local file into the served directory and return the URL the TV
  * should stream from. Replaces any previously shared file (we only cast one
- * item at a time, so this keeps the cache small).
+ * item at a time, so this keeps the cache small). Re-casting the same item is a
+ * no-op — the file is already in place.
  */
 export async function shareLocalFile(
   localUri: string,
@@ -286,16 +326,20 @@ export async function shareLocalFile(
 ): Promise<string> {
   const baseOrigin = await startFileServer();
   await ensureShareDir();
-  await clearShareDir();
 
   const safeName = sanitizeFileName(displayName);
   const destPath = `${SHARE_DIR}/${safeName}`;
-  const fromPath = localUri.replace(/^file:\/\//, '');
+  const url = `${baseOrigin}/${encodeURIComponent(safeName)}`;
 
-  if (await exists(destPath)) {
-    await unlink(destPath).catch(() => {});
+  // Re-casting the same item: the file is already served — nothing to do.
+  if (lastShared?.localUri === localUri && (await exists(destPath))) {
+    return url;
   }
-  await copyFile(fromPath, destPath);
 
-  return `${baseOrigin}/${encodeURIComponent(safeName)}`;
+  // A different item: drop the previous one, then bring the picked file in.
+  await clearShareDir();
+  await materialize(localUri, destPath);
+
+  lastShared = { localUri, destPath };
+  return url;
 }

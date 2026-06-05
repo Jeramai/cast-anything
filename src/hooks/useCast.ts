@@ -2,17 +2,27 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   castMedia,
   discoverDevices,
+  getCurrentTransportActions,
   getPositionInfo,
   getTransportInfo,
+  getVolume,
   pause,
   play,
   seek,
+  seekBytes,
   setVolume,
   stop,
   type DlnaDevice,
   type TransportState,
 } from '../dlna';
 import { isUnreachableByLan, parseUrl } from '../dlna/url';
+import {
+  addTransportCommandListener,
+  presentKeepAlive,
+  stopKeepAlive,
+  type PlaybackInfo,
+  type TransportAction,
+} from '../background/keepAlive';
 import { shareLocalFile, writePlayerPage } from '../server/fileServer';
 import { startWsServer, wsSendControl } from '../ws/wsServer';
 import { castToSignage, type SignageCastResult } from '../signage/castSignage';
@@ -45,6 +55,14 @@ import {
 
 const SCAN_MS = 6000;
 const POLL_MS = 1500;
+/** One notch per press, like a TV remote (0–100 scale). */
+const VOLUME_STEP = 1;
+
+// Devices that rejected every seek mode (e.g. Samsung "The Freestyle" advertises
+// Seek but its renderer refuses it for pushed content). Remembered by device id
+// so we hide the seek controls from the first cast next time, not just after a
+// failed attempt. Cleared if a seek ever succeeds.
+const seekUnsupportedDevices = new Set<string>();
 
 export type PlaybackStatus = TransportState | 'IDLE';
 
@@ -56,10 +74,20 @@ export interface UseCast {
   devices: DlnaDevice[];
   isScanning: boolean;
   selectedDevice: DlnaDevice | null;
+  /** The current selection (what a Cast press will send). */
   media: MediaItem | null;
+  /** What's actually on the TV right now (snapshot from the last cast). */
+  nowPlaying: MediaItem | null;
+  /** True while the picked file is being imported (copied) by the OS picker. */
+  importing: boolean;
   status: PlaybackStatus;
   position: number;
   duration: number;
+  /** False once the selected device has refused every seek mode (e.g. Samsung
+   * "The Freestyle" — it advertises Seek but its renderer won't honor it). */
+  seekSupported: boolean;
+  /** Last known device volume (0–100), or null if not read / unsupported. */
+  volume: number | null;
   busy: boolean;
   error: string | null;
   signage: SignageCastResult | null;
@@ -75,7 +103,8 @@ export interface UseCast {
   onPause: () => Promise<void>;
   onStop: () => Promise<void>;
   onSeek: (seconds: number) => Promise<void>;
-  onVolume: (volume: number) => Promise<void>;
+  /** Step the device volume by `delta` notches (±) on the 0–100 scale. */
+  onVolumeStep: (delta: number) => Promise<void>;
   dismissError: () => void;
   dismissSignage: () => void;
 }
@@ -85,9 +114,19 @@ export function useCast(): UseCast {
   const [isScanning, setIsScanning] = useState(false);
   const [selectedDevice, setSelectedDevice] = useState<DlnaDevice | null>(null);
   const [media, setMedia] = useState<MediaItem | null>(null);
+  // What's actually on the TV — a snapshot taken when a cast succeeds. Kept
+  // separate from `media` (the current selection) so picking a new file doesn't
+  // make "Now playing" / the notification show something the TV isn't playing.
+  const [nowPlaying, setNowPlaying] = useState<MediaItem | null>(null);
+  const [importing, setImporting] = useState(false);
+  // Bumped on each successful seek so the playback notification re-syncs its
+  // timeline (we otherwise let the MediaSession extrapolate, ignoring polls).
+  const [seekNonce, setSeekNonce] = useState(0);
   const [status, setStatus] = useState<PlaybackStatus>('IDLE');
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
+  const [volume, setVol] = useState<number | null>(null);
+  const [seekSupported, setSeekSupported] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [signage, setSignage] = useState<SignageCastResult | null>(null);
@@ -100,6 +139,10 @@ export function useCast(): UseCast {
   const discoveryRef = useRef<{ stop: () => void } | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Mirror of `status` for callbacks that need the latest value without being
+  // re-created (e.g. onSeek deciding whether to resume after a pause-seek).
+  const statusRef = useRef<PlaybackStatus>('IDLE');
+  statusRef.current = status;
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
@@ -156,15 +199,23 @@ export function useCast(): UseCast {
 
   const selectDevice = useCallback((d: DlnaDevice) => {
     setSelectedDevice(d);
+    setVol(null); // volume is per-device; re-read on next cast
+    setSeekSupported(!seekUnsupportedDevices.has(d.id));
   }, []);
 
   const chooseFile = useCallback(async () => {
     setError(null);
+    // The OS picker copies the chosen file into our cache before resolving; for
+    // a multi-GB file that takes a while (it runs natively, so the app stays
+    // responsive — but show a spinner so it doesn't look dead).
+    setImporting(true);
     try {
       const item = await pickMedia();
       if (item) setMedia(item);
     } catch (e) {
       setError(errMessage(e));
+    } finally {
+      setImporting(false);
     }
   }, []);
 
@@ -193,6 +244,7 @@ export function useCast(): UseCast {
     if (selectedDevice.isSignage) {
       try {
         setSignage(await castToSignage(selectedDevice.address, media));
+        setNowPlaying(media);
         setStatus('IDLE');
       } catch (e) {
         setError(errMessage(e));
@@ -246,10 +298,14 @@ export function useCast(): UseCast {
         kind: media.kind,
         mime: media.mime,
       });
+      setNowPlaying(media);
       setStatus('PLAYING');
       setPosition(0);
       setDuration(0);
+      setSeekSupported(!seekUnsupportedDevices.has(selectedDevice.id));
       startPolling(selectedDevice);
+      // Photos have no volume; only sync it for audio/video.
+      if (media.kind !== 'image') refreshVolume(selectedDevice);
     } catch (e) {
       const msg = errMessage(e);
       // DLNA push rejected (UPnP 402) — the device may be signage we didn't
@@ -257,6 +313,7 @@ export function useCast(): UseCast {
       if (/\b402\b/.test(msg) && selectedDevice.address) {
         try {
           setSignage(await castToSignage(selectedDevice.address, media));
+          setNowPlaying(media);
           setStatus('IDLE');
           return;
         } catch (e2) {
@@ -314,6 +371,7 @@ export function useCast(): UseCast {
         await stop(d);
         setStatus('STOPPED');
         setPosition(0);
+        setNowPlaying(null);
         stopPolling();
       }),
     [runAction, stopPolling],
@@ -322,19 +380,107 @@ export function useCast(): UseCast {
   const onSeek = useCallback(
     (seconds: number) =>
       runAction(async (d) => {
-        await seek(d, seconds);
-        setPosition(seconds);
+        const seekFault = (e: unknown) =>
+          e instanceof Error && /\b(701|710|711)\b/.test(e.message);
+        const applyOk = () => {
+          setPosition(seconds);
+          setSeekNonce((n) => n + 1); // re-sync the notification timeline
+          seekUnsupportedDevices.delete(d.id);
+          setSeekSupported(true);
+        };
+
+        // Log the *actual* transport state so we can tell why a seek is refused
+        // (701 is state-based — the device won't seek from where it currently is).
+        let trackURI = '';
+        let trackDuration = 0;
+        try {
+          const [ti, pi] = await Promise.all([getTransportInfo(d), getPositionInfo(d)]);
+          trackURI = pi.trackURI;
+          trackDuration = pi.duration;
+          console.log(`[DLNA] seek: state=${ti.state} pos=${pi.position} dur=${pi.duration}`);
+        } catch {
+          /* diagnostics only */
+        }
+
+        // (A) Standard time seek (REL_TIME). Works on most renderers; Samsung
+        //     answers 701 here (X_DLNA_SeekTime is 710 "not supported").
+        try {
+          await seek(d, seconds, 'REL_TIME');
+          applyOk();
+          return;
+        } catch (e) {
+          if (!seekFault(e)) throw e;
+        }
+
+        // (B) Samsung-native byte seek: derive the byte offset from the served
+        //     file's size (Content-Length of the track URI) and the time fraction,
+        //     then X_DLNA_SeekByte. The device snaps to the nearest keyframe.
+        if (trackURI && trackDuration > 0) {
+          try {
+            const head = await fetch(trackURI, { method: 'HEAD' });
+            const size = Number(head.headers.get('content-length'));
+            if (Number.isFinite(size) && size > 0) {
+              const offset = Math.max(0, Math.min(size - 1, Math.floor((size * seconds) / trackDuration)));
+              await seekBytes(d, offset);
+              applyOk();
+              return;
+            }
+          } catch (e) {
+            if (!seekFault(e)) throw e;
+          }
+        }
+
+        // Every seek mode refused — this renderer doesn't honor Seek for pushed
+        // content. Remember it and hide the seek controls instead of throwing.
+        seekUnsupportedDevices.add(d.id);
+        setSeekSupported(false);
+        try {
+          const actions = await getCurrentTransportActions(d);
+          console.warn('[DLNA] seek unsupported by device. It allows:', actions);
+        } catch {
+          console.warn('[DLNA] seek unsupported by device; GetCurrentTransportActions failed.');
+        }
       }),
     [runAction],
   );
 
-  const onVolume = useCallback(
-    (volume: number) => runAction((d) => setVolume(d, volume)),
+  // Read the device's current volume so the on-screen value (and the next
+  // relative step) start from the truth, not a guess. Best-effort: renderers
+  // that don't implement RenderingControl just leave volume null.
+  const refreshVolume = useCallback(async (d: DlnaDevice) => {
+    try {
+      const v = await getVolume(d);
+      if (v != null) setVol(v);
+    } catch {
+      /* device doesn't support volume read */
+    }
+  }, []);
+
+  const volumeRef = useRef<number | null>(null);
+  useEffect(() => {
+    volumeRef.current = volume;
+  }, [volume]);
+
+  // Relative volume: read the current level once, then nudge it by `delta`
+  // notches per press (was jumping to a fixed absolute level before, which
+  // lurched the volume by ~40). `volumeRef` avoids re-reading on every press.
+  const onVolumeStep = useCallback(
+    (delta: number) =>
+      runAction(async (d) => {
+        let base = volumeRef.current;
+        if (base == null) base = (await getVolume(d)) ?? 50;
+        const next = Math.max(0, Math.min(100, base + delta));
+        await setVolume(d, next);
+        setVol(next);
+      }),
     [runAction],
   );
 
   const dismissError = useCallback(() => setError(null), []);
-  const dismissSignage = useCallback(() => setSignage(null), []);
+  const dismissSignage = useCallback(() => {
+    setSignage(null);
+    setNowPlaying(null);
+  }, []);
 
   // Controls are pushed instantly over the WebSocket. Optimistic local state is
   // corrected by the status the panel streams back.
@@ -346,10 +492,14 @@ export function useCast(): UseCast {
     setSigPlaying(false);
     wsSendControl('pause');
   }, []);
-  const sigSeek = useCallback((delta: number) => wsSendControl('seekBy', delta), []);
+  const sigSeek = useCallback((delta: number) => {
+    wsSendControl('seekBy', delta);
+    setSeekNonce((n) => n + 1);
+  }, []);
   const sigSeekTo = useCallback((seconds: number) => {
     setSigPosition(seconds);
     wsSendControl('seekTo', seconds);
+    setSeekNonce((n) => n + 1);
   }, []);
 
   // When a signage panel is selected, bring up the player page + the WebSocket
@@ -386,11 +536,87 @@ export function useCast(): UseCast {
     };
   }, [selectedDevice]);
 
+  // A cast is "active" — show the playback notification + keep the phone alive —
+  // whenever DLNA playback is running or a signage cast is up. Local files also
+  // need the phone to keep serving; remote URLs just want the control surface.
+  const dlnaActive =
+    status === 'PLAYING' ||
+    status === 'PAUSED_PLAYBACK' ||
+    status === 'TRANSITIONING';
+  const castActive = dlnaActive || !!signage;
+
+  // Playback snapshot for the notification. Signage state comes from the panel's
+  // WebSocket; DLNA state from polling. Driven by `nowPlaying` (what's actually
+  // cast), not the live selection. Photos get no transport controls.
+  const pbTitle = nowPlaying?.name ?? 'Media';
+  const pbState: PlaybackInfo['state'] = signage
+    ? sigPlaying
+      ? 'playing'
+      : 'paused'
+    : status === 'PAUSED_PLAYBACK'
+      ? 'paused'
+      : status === 'STOPPED' || status === 'NO_MEDIA_PRESENT'
+        ? 'stopped'
+        : // PLAYING *and* TRANSITIONING keep the bar moving — a brief buffering
+          // blip shouldn't freeze/reset the notification timeline.
+          'playing';
+  const pbDuration = signage ? sigDuration : duration;
+  const pbControls = nowPlaying?.kind !== 'image';
+
+  // Current position via a ref so the notification effect doesn't re-fire on
+  // every poll tick — the MediaSession extrapolates the seek bar between updates.
+  const pbPositionRef = useRef(0);
+  useEffect(() => {
+    pbPositionRef.current = signage ? sigPosition : position;
+  }, [signage, sigPosition, position]);
+
+  useEffect(() => {
+    if (castActive) {
+      presentKeepAlive({
+        title: pbTitle,
+        state: pbState,
+        position: pbPositionRef.current,
+        duration: pbDuration,
+        controls: pbControls,
+      });
+    } else {
+      stopKeepAlive();
+    }
+  }, [castActive, pbTitle, pbState, pbDuration, pbControls, seekNonce]);
+
+  // Route notification / lock-screen controls to whichever path is active (DLNA
+  // push vs the signage WebSocket). Held in a ref so the listener stays stable.
+  const transportRef = useRef<(action: TransportAction, value: number | null) => void>(
+    () => {},
+  );
+  transportRef.current = (action, value) => {
+    if (signage) {
+      if (action === 'play') sigPlay();
+      else if (action === 'pause') sigPause();
+      else if (action === 'stop') sigPause(); // signage has no hard stop — pause
+      else if (action === 'seekBy') sigSeek(value ?? 0);
+      else if (action === 'seekTo') sigSeekTo(value ?? 0);
+    } else {
+      if (action === 'play') onPlay();
+      else if (action === 'pause') onPause();
+      else if (action === 'stop') onStop();
+      else if (action === 'seekBy') onSeek(Math.max(0, pbPositionRef.current + (value ?? 0)));
+      else if (action === 'seekTo') onSeek(value ?? 0);
+    }
+  };
+  useEffect(() => {
+    const sub = addTransportCommandListener((action, value) =>
+      transportRef.current(action, value),
+    );
+    return () => sub.remove();
+  }, []);
+
   useEffect(() => {
     return () => {
       discoveryRef.current?.stop();
       if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
       if (pollRef.current) clearInterval(pollRef.current);
+      stopKeepAlive();
     };
   }, []);
 
@@ -399,9 +625,13 @@ export function useCast(): UseCast {
     isScanning,
     selectedDevice,
     media,
+    nowPlaying,
+    importing,
     status,
     position,
     duration,
+    seekSupported,
+    volume,
     busy,
     error,
     signage,
@@ -426,7 +656,7 @@ export function useCast(): UseCast {
     onPause,
     onStop,
     onSeek,
-    onVolume,
+    onVolumeStep,
     dismissError,
     dismissSignage,
   };

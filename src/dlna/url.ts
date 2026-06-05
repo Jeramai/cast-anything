@@ -34,8 +34,10 @@ export function isUnreachableByLan(host: string): boolean {
   return (
     host === 'localhost' ||
     host === '0.0.0.0' ||
-    host === '10.0.2.15' || // Android emulator (AVD) NAT address for the guest
-    host === '10.0.3.15' || // Genymotion
+    // Android emulator (AVD) NAT subnet — the guest is usually .15 but a second
+    // instance gets .16, .17, …; none are reachable from the real LAN.
+    host.startsWith('10.0.2.') ||
+    host.startsWith('10.0.3.') || // Genymotion's equivalent NAT subnet
     host.startsWith('127.') ||
     host.startsWith('169.254.') // link-local (no DHCP lease)
   );

@@ -77,10 +77,48 @@ your local network"** prompt — tap **Allow**, or discovery returns nothing.
 1. **Scan for devices** → tap your TV in the list (Samsung sets show 📺).
 2. **Pick a file** from your phone, **or** paste a media URL.
 3. **Cast to device ▶** — playback starts on the TV.
-4. Use **Play / Pause / Stop / ⏪15 / 15⏩** and the volume buttons.
+4. Use **Play / Pause / Stop / ⏪15 / 15⏩** and the **🔉 − / 🔊 +** volume
+   buttons. Volume steps **one notch at a time** (the readout between the
+   buttons shows the TV's current 0–100 level). **Photos** only show a *Remove
+   from screen* button — there's no timeline or volume to control for an image.
 
 The first time, the Samsung TV may show an **"Allow this device to connect?"**
 prompt — accept it on the TV with the remote.
+
+---
+
+## Background casting & the playback notification
+
+While **any** cast is active, the app shows a **playback notification** and keeps
+itself alive so controls keep working with the screen off. (A **local** file is
+also *served from the phone*, so the phone genuinely has to keep running; a remote
+**URL** is fetched by the TV directly, but the notification still gives you a
+remote control.) Via the local native module
+[`modules/cast-keep-alive`](modules/cast-keep-alive):
+
+- **Android:** a **foreground service** that posts a **media-style notification**
+  — title, **⏪15 / play-pause / 15⏩ / stop** buttons, and (for audio/video) a
+  **lock-screen seek bar** — backed by a `MediaSession`, so the controls also
+  appear on the lock screen and respond to Bluetooth/headset keys. Photos show
+  just a *Remove* action (no timeline). Tapping a control routes back through the
+  app to the matching DLNA / signage command. The service also holds a partial
+  **wake lock** + a high-performance **Wi-Fi lock** so a local-file cast keeps
+  serving with the screen fully off/locked.
+- **iOS:** a `UIApplication` **background task** (no media notification — iOS has
+  no app-controllable media controls without an active audio session). iOS does
+  **not** allow an indefinite background HTTP server — it closes listening sockets
+  once the app is suspended — so this only buys a **short grace window** (tens of
+  seconds) after a manual lock. Keep-awake (`expo-keep-awake`) covers the common
+  idle-lock case; for truly indefinite locked playback on iOS there's no
+  App-Store-safe mechanism (the usual workaround is playing silent audio under the
+  `audio` background mode, which this app deliberately does **not** do).
+
+> **Rebuild required.** This adds native code (`expo-keep-awake` + the local
+> `cast-keep-alive` module), so you must **`npx expo prebuild` and rebuild the
+> dev client** (`npm run android` / `npm run ios`) for it to take effect. The JS
+> degrades gracefully on an older binary — it just no-ops until rebuilt. On
+> Android 13+ the notification needs the **POST_NOTIFICATIONS** permission to be
+> visible; the service (and casting) run either way.
 
 ---
 
@@ -136,7 +174,7 @@ src/
     ssdp.ts                 SSDP M-SEARCH discovery over UDP multicast
     device.ts               Fetch + parse the UPnP device description XML
     avtransport.ts          SOAP control: SetAVTransportURI/Play/Pause/Stop/Seek
-                            /GetPositionInfo/GetTransportInfo/SetVolume + DIDL-Lite
+                            /GetPositionInfo/GetTransportInfo/Get+SetVolume + DIDL-Lite
     url.ts                  Relative→absolute URL resolution (RN's URL is unreliable)
     types.ts                Shared types
     index.ts                discoverDevices() orchestration + barrel exports
@@ -144,8 +182,12 @@ src/
     fileServer.ts           Native HTTP server (Range-capable) to stream local files
   media/
     media.ts                File picker + MIME/kind inference (+ URL helper)
+  background/
+    keepAlive.ts            Keep-awake + foreground/background keep-alive while casting
   hooks/
     useCast.ts              State machine tying discovery, server and playback together
+modules/
+  cast-keep-alive/          Local Expo module: Android foreground service / iOS bg task
 ```
 
 ### Key native dependencies
@@ -157,6 +199,8 @@ src/
   native Lighttpd server that handles **HTTP Range** requests, so video seeking
   works and large files stream without buffering through JS. (Both ship
   TurboModule specs and support the New Architecture.)
+- `expo-keep-awake` — stops the screen auto-locking while a local-file cast is
+  active (paired with the `cast-keep-alive` module for true background serving).
 - `expo-document-picker`, `expo-network`, `expo-system-ui`,
   `react-native-safe-area-context`.
 
@@ -190,9 +234,14 @@ src/
   already listening (so reloads are seamless). If you're upgrading from an older
   build that used a random port, **fully restart the app once** to clear the
   legacy orphan; after that, reloads just reuse the running server.
-- **Playback stops when the phone locks / app backgrounds:** the file is served
-  from the phone, so keep the app in the foreground while casting local files.
-  (Casting a remote **URL** doesn't depend on the phone staying awake.)
+- **Playback stops when the phone locks / app backgrounds:** a local file is
+  served *from the phone*, so the phone has to stay alive. The app now keeps it
+  alive while a cast is active, with a playback notification — see
+  [Background casting & the playback notification](#background-casting--the-playback-notification)
+  below. Note
+  this needs a **rebuild** to take effect, and **iOS can only hold a short grace
+  window** when manually locked. Casting a remote **URL** never depends on the
+  phone, since the TV fetches it directly from the internet.
 
 ---
 
