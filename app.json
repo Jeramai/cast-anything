@@ -24,7 +24,7 @@
     "android": {
       "package": "com.castanything.app",
       "adaptiveIcon": {
-        "backgroundColor": "#0b0f17",
+        "backgroundColor": "#edf4ff",
         "foregroundImage": "./assets/android-icon-foreground.png",
         "backgroundImage": "./assets/android-icon-background.png",
         "monochromeImage": "./assets/android-icon-monochrome.png"
@@ -49,7 +49,124 @@
           }
         }
       ],
-      "expo-font"
+      "expo-font",
+      [
+        "@howincodes/expo-dynamic-app-icon",
+        {
+          "blue": {
+            "ios": "./assets/icons/blue.png",
+            "android": {
+              "foregroundImage": "./assets/icons/blue-fg.png",
+              "backgroundColor": "#edf4ff"
+            }
+          },
+          "indigo": {
+            "ios": "./assets/icons/indigo.png",
+            "android": {
+              "foregroundImage": "./assets/icons/indigo-fg.png",
+              "backgroundColor": "#eff0fe"
+            }
+          },
+          "violet": {
+            "ios": "./assets/icons/violet.png",
+            "android": {
+              "foregroundImage": "./assets/icons/violet-fg.png",
+              "backgroundColor": "#f3effe"
+            }
+          },
+          "fuchsia": {
+            "ios": "./assets/icons/fuchsia.png",
+            "android": {
+              "foregroundImage": "./assets/icons/fuchsia-fg.png",
+              "backgroundColor": "#fbedfd"
+            }
+          },
+          "pink": {
+            "ios": "./assets/icons/pink.png",
+            "android": {
+              "foregroundImage": "./assets/icons/pink-fg.png",
+              "backgroundColor": "#fdedf5"
+            }
+          },
+          "rose": {
+            "ios": "./assets/icons/rose.png",
+            "android": {
+              "foregroundImage": "./assets/icons/rose-fg.png",
+              "backgroundColor": "#fff1f3"
+            }
+          },
+          "red": {
+            "ios": "./assets/icons/red.png",
+            "android": {
+              "foregroundImage": "./assets/icons/red-fg.png",
+              "backgroundColor": "#fdecec"
+            }
+          },
+          "firebrick": {
+            "ios": "./assets/icons/firebrick.png",
+            "android": {
+              "foregroundImage": "./assets/icons/firebrick-fg.png",
+              "backgroundColor": "#f7e9e9"
+            }
+          },
+          "orange": {
+            "ios": "./assets/icons/orange.png",
+            "android": {
+              "foregroundImage": "./assets/icons/orange-fg.png",
+              "backgroundColor": "#fff4ec"
+            }
+          },
+          "amber": {
+            "ios": "./assets/icons/amber.png",
+            "android": {
+              "foregroundImage": "./assets/icons/amber-fg.png",
+              "backgroundColor": "#fff9e9"
+            }
+          },
+          "lime": {
+            "ios": "./assets/icons/lime.png",
+            "android": {
+              "foregroundImage": "./assets/icons/lime-fg.png",
+              "backgroundColor": "#f6fdeb"
+            }
+          },
+          "emerald": {
+            "ios": "./assets/icons/emerald.png",
+            "android": {
+              "foregroundImage": "./assets/icons/emerald-fg.png",
+              "backgroundColor": "#ebfbf5"
+            }
+          },
+          "teal": {
+            "ios": "./assets/icons/teal.png",
+            "android": {
+              "foregroundImage": "./assets/icons/teal-fg.png",
+              "backgroundColor": "#eafbf9"
+            }
+          },
+          "cyan": {
+            "ios": "./assets/icons/cyan.png",
+            "android": {
+              "foregroundImage": "./assets/icons/cyan-fg.png",
+              "backgroundColor": "#e9fbfd"
+            }
+          },
+          "sky": {
+            "ios": "./assets/icons/sky.png",
+            "android": {
+              "foregroundImage": "./assets/icons/sky-fg.png",
+              "backgroundColor": "#ebf8fe"
+            }
+          },
+          "slate": {
+            "ios": "./assets/icons/slate.png",
+            "android": {
+              "foregroundImage": "./assets/icons/slate-fg.png",
+              "backgroundColor": "#f5f6f8"
+            }
+          }
+        }
+      ]
     ]
   }
 }

@@ -38,6 +38,7 @@ import {
   type ThemePalette,
 } from "./src/theme/themes";
 import { loadThemeChoice, saveThemeChoice } from "./src/theme/themeStore";
+import { setAccentIcon } from "./src/icon/dynamicIcon";
 
 // ---- Theme context: the active palette + themed stylesheet ----
 interface ThemeContextValue {
@@ -344,6 +345,20 @@ function CastScreen() {
   // Only read inside the tap handler (never rendered) → a ref avoids a re-render on layout.
   const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+
+  // Repaint the launcher icon to match the accent — but only when the Theme sheet
+  // closes, so rapidly previewing accents doesn't swap on every tap. We snapshot the
+  // accent on open and diff on close. accentLatest tracks the live accent so the
+  // close-diff sees the final choice without re-running mid-preview. No-ops gracefully
+  // if the native module is absent (older dev build) — the icon updates next rebuild.
+  const accentLatest = useRef(accentKey);
+  accentLatest.current = accentKey;
+  const accentAtOpen = useRef(accentKey);
+  useEffect(() => {
+    if (settingsOpen) accentAtOpen.current = accentLatest.current;
+    else if (accentLatest.current !== accentAtOpen.current)
+      setAccentIcon(accentLatest.current);
+  }, [settingsOpen]);
 
   const isPlaying = cast.status === "PLAYING";
   const isPaused = cast.status === "PAUSED_PLAYBACK";

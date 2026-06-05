@@ -1,0 +1,21 @@
+{
+  "default": "#edf4ff",
+  "accents": {
+    "blue": "#edf4ff",
+    "indigo": "#eff0fe",
+    "violet": "#f3effe",
+    "fuchsia": "#fbedfd",
+    "pink": "#fdedf5",
+    "rose": "#fff1f3",
+    "red": "#fdecec",
+    "firebrick": "#f7e9e9",
+    "orange": "#fff4ec",
+    "amber": "#fff9e9",
+    "lime": "#f6fdeb",
+    "emerald": "#ebfbf5",
+    "teal": "#eafbf9",
+    "cyan": "#e9fbfd",
+    "sky": "#ebf8fe",
+    "slate": "#f5f6f8"
+  }
+}
