@@ -60,6 +60,22 @@ function upnpClassFor(kind: MediaKind): string {
 }
 
 /**
+ * DLNA `contentFeatures.dlna.org` / protocolInfo flags for a media kind. Used both
+ * in the DIDL metadata and as the HTTP response header our media server returns.
+ *
+ * DLNA.ORG_OP is two bits <time-seek><byte-seek>:
+ *   video/audio → OP=11 — the server supports BOTH a DLNA TimeSeekRange and a byte
+ *     Range. Samsung refuses Seek (701 "not available") unless time-seek is claimed
+ *     here AND the server actually answers TimeSeekRange — which our media server does.
+ *   image → OP=00 (no seek); advertising seek flags on a photo makes Samsung 402.
+ */
+export function contentFeatures(kind: MediaKind): string {
+  return kind === 'image'
+    ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000'
+    : 'DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+}
+
+/**
  * Build DIDL-Lite metadata for the item. Samsung TVs are picky: without valid
  * metadata (title + upnp:class + a `res` with a sensible protocolInfo) they may
  * refuse to start playback or show no title.
@@ -69,21 +85,24 @@ export function buildDidlMetadata(opts: {
   title: string;
   kind: MediaKind;
   mime: string;
+  /** File size in bytes — lets the renderer map a time target to a byte range. */
+  size?: number;
+  /** Media duration in seconds — without it, Samsung rejects Seek as 701. */
+  durationSec?: number;
 }): string {
-  // DLNA.ORG_OP is two bits: <time-seek><byte-seek>.
-  //   video/audio → OP=11 (BOTH time- and byte-seek). We must advertise
-  //     time-seek (the first 1): the UPnP `Seek` action uses Unit=REL_TIME, and
-  //     Samsung renderers honor exactly what we claim — with OP=01 (byte only)
-  //     they reject every REL_TIME seek with UPnP 701 "Transition not available".
-  //     With OP=11 they accept it and perform a byte-range GET at the computed
-  //     offset, which our Range-capable server handles.
-  //   image → OP=00 (no seek). Advertising a photo with the streaming/seek flags
-  //     makes Samsung reject the item with UPnP 402 (Invalid Args).
-  const dlnaFlags =
-    opts.kind === 'image'
-      ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000'
-      : 'DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
+  const dlnaFlags = contentFeatures(opts.kind);
   const protocolInfo = `http-get:*:${opts.mime}:${dlnaFlags}`;
+  // A seekable timeline needs a duration on the <res>; without it Samsung answers
+  // Seek with 701 "not available". size lets the renderer map time → byte range.
+  const resAttrs = [
+    `protocolInfo="${protocolInfo}"`,
+    opts.size && opts.size > 0 ? `size="${Math.floor(opts.size)}"` : '',
+    opts.durationSec && opts.durationSec > 0 && opts.kind !== 'image'
+      ? `duration="${secondsToHms(opts.durationSec)}"`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
   return (
     '<DIDL-Lite ' +
     'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" ' +
@@ -93,7 +112,7 @@ export function buildDidlMetadata(opts: {
     '<item id="0" parentID="-1" restricted="1">' +
     `<dc:title>${escapeXml(opts.title)}</dc:title>` +
     `<upnp:class>${upnpClassFor(opts.kind)}</upnp:class>` +
-    `<res protocolInfo="${protocolInfo}">${escapeXml(opts.url)}</res>` +
+    `<res ${resAttrs}>${escapeXml(opts.url)}</res>` +
     '</item>' +
     '</DIDL-Lite>'
   );
@@ -363,7 +382,14 @@ async function inspectDevice(device: DlnaDevice): Promise<void> {
 /** Convenience: load metadata + URL, then start playback. */
 export async function castMedia(
   device: DlnaDevice,
-  opts: { url: string; title: string; kind: MediaKind; mime: string },
+  opts: {
+    url: string;
+    title: string;
+    kind: MediaKind;
+    mime: string;
+    size?: number;
+    durationSec?: number;
+  },
 ): Promise<void> {
   const metadata = buildDidlMetadata(opts);
   try {

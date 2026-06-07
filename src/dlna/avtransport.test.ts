@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 import { describe, expect, test } from "bun:test";
-import { buildDidlMetadata, hmsToSeconds, secondsToHms } from "./avtransport";
+import { buildDidlMetadata, contentFeatures, hmsToSeconds, secondsToHms } from "./avtransport";
 
 describe("secondsToHms", () => {
   test("formats H:MM:SS", () => {
@@ -74,5 +74,42 @@ describe("buildDidlMetadata", () => {
     expect(xml).toContain("Tom &amp; &quot;Jerry&quot; &lt;fun&gt;");
     expect(xml).toContain("a=1&amp;b=2");
     expect(xml).not.toContain("Tom & ");
+  });
+
+  test("adds size + duration attributes on the res when provided (enables seeking)", () => {
+    const xml = buildDidlMetadata({
+      url: "http://h/a.mp4",
+      title: "Clip",
+      kind: "video",
+      mime: "video/mp4",
+      size: 12345,
+      durationSec: 84,
+    });
+    expect(xml).toContain('size="12345"');
+    expect(xml).toContain('duration="0:01:24"');
+  });
+
+  test("omits size/duration when absent, and never adds duration to an image", () => {
+    const noMeta = buildDidlMetadata({ url: "http://h/a.mp4", title: "C", kind: "video", mime: "video/mp4" });
+    expect(noMeta).not.toContain("size=");
+    expect(noMeta).not.toContain("duration=");
+    const img = buildDidlMetadata({
+      url: "http://h/p.jpg",
+      title: "P",
+      kind: "image",
+      mime: "image/jpeg",
+      durationSec: 84,
+    });
+    expect(img).not.toContain("duration=");
+  });
+});
+
+describe("contentFeatures", () => {
+  test("video/audio advertise both seek modes (OP=11)", () => {
+    expect(contentFeatures("video")).toContain("DLNA.ORG_OP=11");
+    expect(contentFeatures("audio")).toContain("DLNA.ORG_OP=11");
+  });
+  test("image is non-seekable (OP=00)", () => {
+    expect(contentFeatures("image")).toContain("DLNA.ORG_OP=00");
   });
 });

@@ -27,6 +27,8 @@ import { Ionicons } from "@expo/vector-icons";
 import * as SystemUI from "expo-system-ui";
 import type { DlnaDevice } from "./src/dlna";
 import { useCast } from "./src/hooks/useCast";
+import type { OutputMode } from "./src/convert/gallery";
+import { setScreenAwake } from "./src/background/keepAlive";
 import {
   ACCENTS,
   BASES,
@@ -73,12 +75,18 @@ type BtnProps = PressableProps & {
   icon?: keyof typeof Ionicons.glyphMap;
   variant?: "primary" | "secondary" | "ghost";
   loading?: boolean;
+  /** When set (0–1), the button becomes a progress bar that fills left→right. */
+  progress?: number | null;
+  /** Verb shown while `progress` is active, e.g. "Sending" → "Sending… 42%". */
+  progressLabel?: string;
 };
 
-function Button({ title, icon, variant = "secondary", loading, disabled, style, ...rest }: BtnProps) {
+function Button({ title, icon, variant = "secondary", loading, progress, progressLabel, disabled, style, ...rest }: BtnProps) {
   const { C, styles } = useTheme();
-  const isDisabled = disabled || loading;
+  const showProgress = progress != null;
+  const isDisabled = disabled || loading || showProgress;
   const fg = variant === "primary" ? "#fff" : C.text;
+  const pct = showProgress ? Math.round(progress * 100) : 0;
   return (
     <Pressable
       disabled={isDisabled}
@@ -86,13 +94,22 @@ function Button({ title, icon, variant = "secondary", loading, disabled, style, 
         styles.btn,
         variant === "primary" && styles.btnPrimary,
         variant === "ghost" && styles.btnGhost,
-        isDisabled && styles.btnDisabled,
+        isDisabled && !showProgress && styles.btnDisabled,
         pressed && !isDisabled && styles.btnPressed,
+        showProgress && { overflow: "hidden" },
         style as object,
       ]}
       {...rest}
     >
-      {loading ? (
+      {showProgress ? (
+        <>
+          <View style={[styles.btnProgressFill, { width: `${pct}%` }]} />
+          <View style={styles.btnContent}>
+            <ActivityIndicator size="small" color={fg} />
+            <Text style={[styles.btnText, styles.btnTextPrimary]}>{progressLabel ?? "Sending"}… {pct}%</Text>
+          </View>
+        </>
+      ) : loading ? (
         <ActivityIndicator color={variant === "primary" ? "#fff" : C.text} />
       ) : (
         <View style={styles.btnContent}>
@@ -171,12 +188,14 @@ function NowPlayingSheet({
   isImage,
   isPlaying,
   isPaused,
+  isTransitioning,
   progress,
 }: {
   cast: ReturnType<typeof useCast>;
   isImage: boolean;
   isPlaying: boolean;
   isPaused: boolean;
+  isTransitioning: boolean;
   progress: number;
 }) {
   const { styles } = useTheme();
@@ -218,6 +237,7 @@ function NowPlayingSheet({
     }).start();
   };
 
+  const barWidthRef = useRef(0);
   const panRef = useRef<ReturnType<typeof PanResponder.create> | null>(null);
   if (panRef.current === null) {
     panRef.current = PanResponder.create({
@@ -267,7 +287,9 @@ function NowPlayingSheet({
               pointerEvents={expanded ? "none" : "auto"}
               style={{ opacity: peekOpacity, transform: [{ scale: peekScale }] }}
             >
-              {isPlaying ? (
+              {isTransitioning ? (
+                <Button loading variant="primary" style={styles.peekBtn} />
+              ) : isPlaying ? (
                 <Button icon="pause" variant="primary" onPress={cast.onPause} style={styles.peekBtn} />
               ) : (
                 <Button icon="play" variant="primary" onPress={cast.onPlay} style={styles.peekBtn} />
@@ -289,9 +311,22 @@ function NowPlayingSheet({
           />
         ) : (
           <>
-            <View style={styles.progressTrack}>
-              <View style={[styles.progressFill, { width: `${progress * 100}%` }]} />
-            </View>
+            <Pressable
+              style={styles.progressTrackTappable}
+              onLayout={(e) => {
+                barWidthRef.current = e.nativeEvent.layout.width;
+              }}
+              onPress={(e) => {
+                if (cast.seekSupported && cast.duration > 0 && barWidthRef.current > 0) {
+                  const frac = Math.max(0, Math.min(1, e.nativeEvent.locationX / barWidthRef.current));
+                  cast.onSeek(frac * cast.duration);
+                }
+              }}
+            >
+              <View style={styles.progressTrack}>
+                <View style={[styles.progressFill, { width: `${progress * 100}%` }]} />
+              </View>
+            </Pressable>
             <View style={styles.timeRow}>
               <Text style={styles.timeText}>{formatTime(cast.position)}</Text>
               <Text style={styles.timeText}>
@@ -307,7 +342,9 @@ function NowPlayingSheet({
                 pointerEvents={expanded ? "auto" : "none"}
                 style={[styles.grow, { opacity: bodyPlayOpacity, transform: [{ translateY: bodyPlayShift }] }]}
               >
-                {isPlaying ? (
+                {isTransitioning ? (
+                  <Button loading title="Loading" variant="primary" style={styles.fill} />
+                ) : isPlaying ? (
                   <Button icon="pause" title="Pause" variant="primary" onPress={cast.onPause} style={styles.fill} />
                 ) : (
                   <Button icon="play" title="Play" variant="primary" onPress={cast.onPlay} style={styles.fill} />
@@ -345,6 +382,9 @@ function CastScreen() {
   // Only read inside the tap handler (never rendered) → a ref avoids a re-render on layout.
   const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [convertOpen, setConvertOpen] = useState(false);
+  // Where a conversion's output goes: cache only, or also saved to the gallery.
+  const [outMode, setOutMode] = useState<OutputMode>("cache");
 
   // Repaint the launcher icon to match the accent — but only when the Theme sheet
   // closes, so rapidly previewing accents doesn't swap on every tap. We snapshot the
@@ -362,6 +402,7 @@ function CastScreen() {
 
   const isPlaying = cast.status === "PLAYING";
   const isPaused = cast.status === "PAUSED_PLAYBACK";
+  const isTransitioning = cast.status === "TRANSITIONING";
   const hasPlayback = cast.status !== "IDLE" && cast.status !== "NO_MEDIA_PRESENT";
   const progress = cast.duration > 0 ? Math.min(1, cast.position / cast.duration) : 0;
   // Photos aren't a timeline: no play/pause, seek, scrub or volume — just the
@@ -415,12 +456,26 @@ function CastScreen() {
 
         {/* ---- Media ---- */}
         <Section title="2 · Choose what to cast">
-          <Button
-            icon={cast.importing ? undefined : "folder-open"}
-            title={cast.importing ? "Importing…" : "Pick a file"}
-            loading={cast.importing}
-            onPress={cast.chooseFile}
-          />
+          <View style={styles.pickRow}>
+            <Button
+              icon={cast.importing ? undefined : "folder-open"}
+              title={cast.importing ? "Importing…" : "Pick a file"}
+              loading={cast.importing}
+              onPress={cast.chooseFile}
+              style={{ flex: 1 }}
+            />
+            {/* Convert an unsupported local file (e.g. .mkv/.avi) → MP4. Always shown
+                (when this build has FFmpeg) but disabled until a local file is picked.
+                Opens a dialog that holds the options + progress. */}
+            {cast.canConvert && (
+              <Button
+                icon="sync"
+                title="Convert"
+                disabled={!(cast.media?.isLocal && cast.media.kind !== "image")}
+                onPress={() => setConvertOpen(true)}
+              />
+            )}
+          </View>
           {cast.importing && (
             <Text style={styles.hint}>
               Copying the file into the app — large files can take a moment.
@@ -439,6 +494,7 @@ function CastScreen() {
             />
             <Button
               title="Use"
+              disabled={!urlInput.trim()}
               onPress={() => {
                 cast.chooseUrl(urlInput);
                 setUrlInput("");
@@ -470,11 +526,14 @@ function CastScreen() {
         </Section>
 
         {/* ---- Cast ---- */}
+        {/* While a big local file copies into the server dir, the button itself
+            fills as a progress bar (cast.castProgress); otherwise it spins. */}
         <Button
           icon="play-circle"
           title={cast.selectedDevice?.isSignage ? "Send to signage" : "Cast to device"}
           variant="primary"
           loading={cast.busy}
+          progress={cast.castProgress}
           disabled={!cast.selectedDevice || !cast.media}
           onPress={cast.cast}
           style={{ marginTop: 4 }}
@@ -658,6 +717,90 @@ function CastScreen() {
         </Pressable>
       </Modal>
 
+      {/* ---- Convert dialog ---- */}
+      <Modal
+        visible={convertOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => !cast.converting && setConvertOpen(false)}
+      >
+        <Pressable
+          style={styles.modalBackdrop}
+          onPress={() => !cast.converting && setConvertOpen(false)}
+        >
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Convert for TV</Text>
+              <Pressable
+                onPress={() => setConvertOpen(false)}
+                hitSlop={10}
+                disabled={cast.converting}
+              >
+                <Ionicons name="close" size={22} color={cast.converting ? C.border : C.textDim} />
+              </Pressable>
+            </View>
+
+            {cast.media && (
+              <Text style={styles.hint} numberOfLines={2}>
+                {cast.media.name}
+              </Text>
+            )}
+
+            <Text style={styles.themeLabel}>Save</Text>
+            <View style={styles.themeRow}>
+              {(["cache", "overwrite", "new"] as const).map((m) => (
+                <Pressable
+                  key={m}
+                  onPress={() => setOutMode(m)}
+                  disabled={cast.converting}
+                  style={[styles.outChip, outMode === m && styles.outChipOn]}
+                >
+                  <Text style={[styles.outChipText, outMode === m && styles.outChipTextOn]}>
+                    {m === "cache" ? "Cache only" : m === "overwrite" ? "Overwrite" : "New file"}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={styles.hint}>
+              {outMode === "cache"
+                ? "Kept in the app only, just for this cast."
+                : outMode === "overwrite"
+                  ? "Saved to your gallery, replacing an earlier copy of the same file."
+                  : "Saved to your gallery as a new file each time."}
+            </Text>
+
+            {cast.converting ? (
+              <>
+                <Button
+                  variant="primary"
+                  progress={cast.convertProgress}
+                  progressLabel="Converting"
+                  style={{ marginTop: 14 }}
+                />
+                <Button
+                  icon="close"
+                  title="Cancel"
+                  variant="ghost"
+                  onPress={cast.cancelConversion}
+                  style={{ marginTop: 8 }}
+                />
+              </>
+            ) : (
+              <Button
+                icon="sync"
+                title="Convert"
+                variant="primary"
+                onPress={async () => {
+                  await cast.convertSelected(outMode);
+                  setConvertOpen(false);
+                }}
+                style={{ marginTop: 14 }}
+              />
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       {/* ---- Now playing (draggable bottom-sheet card) ---- */}
       {hasPlayback && (
         <NowPlayingSheet
@@ -665,6 +808,7 @@ function CastScreen() {
           isImage={isImage}
           isPlaying={isPlaying}
           isPaused={isPaused}
+          isTransitioning={isTransitioning}
           progress={progress}
         />
       )}
@@ -684,6 +828,15 @@ export default function App() {
   const [baseKey, setBaseKey] = useState(DEFAULT_BASE_KEY);
   const [accentKey, setAccentKey] = useState(DEFAULT_ACCENT_KEY);
   const loaded = useRef(false);
+
+  // Keep the screen on the whole time the app is in the foreground (releases when
+  // backgrounded). Casting already does this; this also covers setup + conversion.
+  useEffect(() => {
+    setScreenAwake(true);
+    return () => {
+      setScreenAwake(false);
+    };
+  }, []);
 
   // Load the saved choice once on startup.
   useEffect(() => {
@@ -834,6 +987,26 @@ function makeStyles(C: ThemePalette) {
   },
   mediaName: { color: C.text, fontSize: 14, flex: 1 },
   clearX: { color: C.textDim, fontSize: 16, fontWeight: "700" },
+  pickRow: { flexDirection: "row", gap: 10 },
+  outChip: {
+    paddingHorizontal: 11,
+    paddingVertical: 5,
+    borderRadius: 8,
+    backgroundColor: C.card,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  outChipOn: { backgroundColor: C.accentDim, borderColor: C.accent },
+  outChipText: { color: C.textDim, fontSize: 12, fontWeight: "600" },
+  outChipTextOn: { color: C.text },
+  // Translucent fill overlaid on the (accent) primary button to show send progress.
+  btnProgressFill: {
+    position: "absolute",
+    left: 0,
+    top: 0,
+    bottom: 0,
+    backgroundColor: "rgba(255,255,255,0.28)",
+  },
   // Now playing
   nowTitle: { color: C.text, fontSize: 17, fontWeight: "700" },
   statusLabel: { color: C.accent, fontSize: 12, fontWeight: "700", letterSpacing: 1 },

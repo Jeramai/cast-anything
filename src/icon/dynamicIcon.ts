@@ -18,9 +18,6 @@ interface DynamicIconModule {
 
 const Native = requireOptionalNativeModule<DynamicIconModule>('ExpoDynamicAppIcon');
 
-/** True when the native module is present in this binary. */
-export const dynamicIconAvailable = Native != null;
-
 /**
  * Switch the launcher icon to the variant matching `accentKey`.
  *

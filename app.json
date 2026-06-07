@@ -51,6 +51,14 @@
       ],
       "expo-font",
       [
+        "expo-media-library",
+        {
+          "photosPermission": "Cast Anything accesses videos to convert and cast them.",
+          "savePhotosPermission": "Cast Anything saves converted videos to your gallery.",
+          "isAccessMediaLocationEnabled": false
+        }
+      ],
+      [
         "@howincodes/expo-dynamic-app-icon",
         {
           "blue": {

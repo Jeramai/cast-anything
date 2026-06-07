@@ -45,7 +45,10 @@ export async function castToSignage(
   //    (this also starts the server); remote URLs are used directly.
   let mediaUrl = media.uri;
   if (media.isLocal) {
-    mediaUrl = await shareLocalFile(media.uri, media.name);
+    mediaUrl = await shareLocalFile(media.uri, media.name, {
+      mime: media.mime,
+      kind: media.kind,
+    });
   } else {
     await startFileServer();
   }

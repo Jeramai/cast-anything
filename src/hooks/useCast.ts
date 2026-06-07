@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import {
   castMedia,
   discoverDevices,
-  getCurrentTransportActions,
   getPositionInfo,
   getTransportInfo,
   getVolume,
@@ -24,6 +23,8 @@ import {
   type TransportAction,
 } from '../background/keepAlive';
 import { shareLocalFile, writePlayerPage } from '../server/fileServer';
+import { convertForCast, cancelConvert, ffmpegAvailable, probeMedia } from '../convert/transcode';
+import { saveToGallery, type OutputMode } from '../convert/gallery';
 import { startWsServer, wsSendControl } from '../ws/wsServer';
 import { castToSignage, type SignageCastResult } from '../signage/castSignage';
 
@@ -107,6 +108,19 @@ export interface UseCast {
   onVolumeStep: (delta: number) => Promise<void>;
   dismissError: () => void;
   dismissSignage: () => void;
+  /** True if this binary can convert files locally (FFmpeg present). */
+  canConvert: boolean;
+  /** Copy progress (0–1) while a large local file is staged for casting; null otherwise. */
+  castProgress: number | null;
+  /** True while a local conversion is running. */
+  converting: boolean;
+  /** Conversion progress, 0–1 (best-effort). */
+  convertProgress: number;
+  /** Convert the selected local file into a castable MP4, replacing the selection.
+   *  `mode` controls whether the result is also saved to the gallery. */
+  convertSelected: (mode?: OutputMode) => Promise<void>;
+  /** Cancel an in-progress conversion. */
+  cancelConversion: () => void;
 }
 
 export function useCast(): UseCast {
@@ -119,6 +133,11 @@ export function useCast(): UseCast {
   // make "Now playing" / the notification show something the TV isn't playing.
   const [nowPlaying, setNowPlaying] = useState<MediaItem | null>(null);
   const [importing, setImporting] = useState(false);
+  const [converting, setConverting] = useState(false);
+  const [convertProgress, setConvertProgress] = useState(0);
+  // Non-null while a large local file is being copied into the server dir before
+  // the DLNA hand-off (0–1). Null when there's nothing to copy (remote/instant move).
+  const [castProgress, setCastProgress] = useState<number | null>(null);
   // Bumped on each successful seek so the playback notification re-syncs its
   // timeline (we otherwise let the MediaSession extrapolate, ignoring polls).
   const [seekNonce, setSeekNonce] = useState(0);
@@ -126,6 +145,13 @@ export function useCast(): UseCast {
   const [position, setPosition] = useState(0);
   const [duration, setDuration] = useState(0);
   const [volume, setVol] = useState<number | null>(null);
+  // For seeking: the URL we actually served (so a byte-seek can size the file even
+  // when the renderer reports no track URI) and the latest known duration.
+  const lastServedUrlRef = useRef<string | null>(null);
+  const durationRef = useRef(0);
+  // Guards against overlapping seeks (e.g. a double-fired tap), which otherwise
+  // race: the second hits the renderer mid-transition and 701s.
+  const seekInFlightRef = useRef(false);
   const [seekSupported, setSeekSupported] = useState(true);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -160,6 +186,10 @@ export function useCast(): UseCast {
             getTransportInfo(device),
             getPositionInfo(device),
           ]);
+          // If polling was stopped while this request was in flight (e.g. the user
+          // hit Stop), don't clobber the IDLE status the stop just set — otherwise
+          // the device's post-stop "STOPPED" reappears and the sheet pops back.
+          if (!pollRef.current) return;
           setStatus(transport.state);
           setPosition(pos.position);
           setDuration(pos.duration);
@@ -227,6 +257,39 @@ export function useCast(): UseCast {
 
   const clearMedia = useCallback(() => setMedia(null), []);
 
+  // Convert the selected local file into a TV-friendly MP4 (remux + AAC), then
+  // swap it in as the selection so a normal Cast press streams the converted file.
+  const convertSelected = useCallback(
+    async (mode: OutputMode = 'cache') => {
+      if (!media || !media.isLocal) return;
+      setError(null);
+      setConverting(true);
+      setConvertProgress(0);
+      try {
+        const out = await convertForCast(media, { onProgress: setConvertProgress });
+        setMedia(out);
+        if (mode !== 'cache') {
+          // Secondary to the cast: if the gallery save fails, the converted file
+          // still works for casting, so surface a note but don't lose the result.
+          try {
+            await saveToGallery(out.uri, out.name, mode);
+          } catch (e) {
+            setError(`Converted, but couldn't save to gallery: ${errMessage(e)}`);
+          }
+        }
+      } catch (e) {
+        if (!(e as { cancelled?: boolean })?.cancelled) setError(errMessage(e));
+      } finally {
+        setConverting(false);
+      }
+    },
+    [media],
+  );
+
+  const cancelConversion = useCallback(() => {
+    cancelConvert();
+  }, []);
+
   const cast = useCallback(async () => {
     if (!selectedDevice) {
       setError('Pick a TV / device first.');
@@ -255,9 +318,28 @@ export function useCast(): UseCast {
     }
 
     try {
+      // Probe the duration up front (best-effort, local files) so BOTH the media
+      // server (TimeSeekRange → byte mapping) and the DIDL <res> can advertise a
+      // seekable timeline — Samsung rejects Seek with 701 without it.
+      let durationSec = 0;
+      if (media.isLocal && ffmpegAvailable) {
+        try {
+          durationSec = (await probeMedia(media.uri)).durationSec;
+        } catch {
+          /* duration is best-effort */
+        }
+      }
+
       const url = media.isLocal
-        ? await shareLocalFile(media.uri, media.name)
+        ? await shareLocalFile(media.uri, media.name, {
+            mime: media.mime,
+            kind: media.kind,
+            durationSec: durationSec || undefined,
+            size: media.size,
+            onProgress: setCastProgress,
+          })
         : media.uri;
+      lastServedUrlRef.current = url; // for the byte-seek fallback
 
       console.log('[DLNA] casting', {
         url,
@@ -297,6 +379,8 @@ export function useCast(): UseCast {
         title: media.name,
         kind: media.kind,
         mime: media.mime,
+        size: media.size,
+        durationSec: durationSec || undefined,
       });
       setNowPlaying(media);
       setStatus('PLAYING');
@@ -326,6 +410,7 @@ export function useCast(): UseCast {
       setError(msg);
     } finally {
       setBusy(false);
+      setCastProgress(null);
     }
   }, [selectedDevice, media, startPolling]);
 
@@ -369,7 +454,7 @@ export function useCast(): UseCast {
     () =>
       runAction(async (d) => {
         await stop(d);
-        setStatus('STOPPED');
+        setStatus('IDLE'); // back to idle so the Now-Playing sheet hides
         setPosition(0);
         setNowPlaying(null);
         stopPolling();
@@ -380,65 +465,99 @@ export function useCast(): UseCast {
   const onSeek = useCallback(
     (seconds: number) =>
       runAction(async (d) => {
-        const seekFault = (e: unknown) =>
-          e instanceof Error && /\b(701|710|711)\b/.test(e.message);
-        const applyOk = () => {
-          setPosition(seconds);
-          setSeekNonce((n) => n + 1); // re-sync the notification timeline
-          seekUnsupportedDevices.delete(d.id);
-          setSeekSupported(true);
-        };
-
-        // Log the *actual* transport state so we can tell why a seek is refused
-        // (701 is state-based — the device won't seek from where it currently is).
-        let trackURI = '';
-        let trackDuration = 0;
+        // Ignore a seek that arrives while another is still running (double-fired
+        // taps, rapid scrubbing) — it would otherwise hit the renderer mid-jump.
+        if (seekInFlightRef.current) return;
+        seekInFlightRef.current = true;
         try {
-          const [ti, pi] = await Promise.all([getTransportInfo(d), getPositionInfo(d)]);
-          trackURI = pi.trackURI;
-          trackDuration = pi.duration;
-          console.log(`[DLNA] seek: state=${ti.state} pos=${pi.position} dur=${pi.duration}`);
-        } catch {
-          /* diagnostics only */
-        }
+          const codeOf = (e: unknown): string | null => {
+            const m = e instanceof Error ? e.message.match(/\b(70\d|71\d)\b/) : null;
+            return m ? m[1] : null;
+          };
+          const isSeekFault = (c: string | null) => c === '701' || c === '710' || c === '711';
 
-        // (A) Standard time seek (REL_TIME). Works on most renderers; Samsung
-        //     answers 701 here (X_DLNA_SeekTime is 710 "not supported").
-        try {
-          await seek(d, seconds, 'REL_TIME');
-          applyOk();
-          return;
-        } catch (e) {
-          if (!seekFault(e)) throw e;
-        }
+          // Clamp to the timeline so we never seek past the end (→ 711 "illegal target").
+          const dur = durationRef.current;
+          const target =
+            dur > 0 ? Math.max(0, Math.min(Math.floor(seconds), dur - 1)) : Math.max(0, Math.floor(seconds));
+          const applyOk = () => {
+            setPosition(target);
+            setSeekNonce((n) => n + 1); // re-sync the notification timeline
+            seekUnsupportedDevices.delete(d.id);
+            setSeekSupported(true);
+          };
 
-        // (B) Samsung-native byte seek: derive the byte offset from the served
-        //     file's size (Content-Length of the track URI) and the time fraction,
-        //     then X_DLNA_SeekByte. The device snaps to the nearest keyframe.
-        if (trackURI && trackDuration > 0) {
+          // Prefer what the renderer reports, but fall back to the URL we served and
+          // the duration we already know — some renderers return an empty PositionInfo.
+          let trackURI = lastServedUrlRef.current ?? '';
+          let trackDuration = dur;
+          let state = '';
           try {
-            const head = await fetch(trackURI, { method: 'HEAD' });
-            const size = Number(head.headers.get('content-length'));
-            if (Number.isFinite(size) && size > 0) {
-              const offset = Math.max(0, Math.min(size - 1, Math.floor((size * seconds) / trackDuration)));
-              await seekBytes(d, offset);
-              applyOk();
-              return;
-            }
-          } catch (e) {
-            if (!seekFault(e)) throw e;
+            const [ti, pi] = await Promise.all([getTransportInfo(d), getPositionInfo(d)]);
+            state = ti.state;
+            if (pi.trackURI) trackURI = pi.trackURI;
+            if (pi.duration > 0) trackDuration = pi.duration;
+            console.log(`[DLNA] seek: state=${state} pos=${pi.position} dur=${trackDuration} → ${target}`);
+          } catch {
+            /* diagnostics only */
           }
-        }
 
-        // Every seek mode refused — this renderer doesn't honor Seek for pushed
-        // content. Remember it and hide the seek controls instead of throwing.
-        seekUnsupportedDevices.add(d.id);
-        setSeekSupported(false);
-        try {
-          const actions = await getCurrentTransportActions(d);
-          console.warn('[DLNA] seek unsupported by device. It allows:', actions);
-        } catch {
-          console.warn('[DLNA] seek unsupported by device; GetCurrentTransportActions failed.');
+          // The renderer can't seek mid-jump (701). Silently skip — the user can
+          // just seek again once it settles.
+          if (state === 'TRANSITIONING') return;
+
+          // Conclude "unsupported" only if a mode is explicitly rejected with 710
+          // ("seek mode not supported"). 701 (transient) and 711 (bad target) don't
+          // mean the device can't seek, so they must never hide the controls.
+          let definitelyUnsupported = true;
+          let relCode: string | null = null;
+          let byteCode: string | null = null;
+          let triedByte = false;
+
+          // (A) Standard time seek (REL_TIME) — what this TV actually honors.
+          try {
+            await seek(d, target, 'REL_TIME');
+            applyOk();
+            return;
+          } catch (e) {
+            relCode = codeOf(e);
+            if (!isSeekFault(relCode)) throw e;
+            if (relCode !== '710') definitelyUnsupported = false;
+          }
+
+          // (B) Byte seek fallback for renderers that prefer it.
+          if (trackURI && trackDuration > 0) {
+            triedByte = true;
+            try {
+              const head = await fetch(trackURI, { method: 'HEAD' });
+              const size = Number(head.headers.get('content-length'));
+              if (Number.isFinite(size) && size > 0) {
+                const offset = Math.max(0, Math.min(size - 1, Math.floor((size * target) / trackDuration)));
+                await seekBytes(d, offset);
+                applyOk();
+                return;
+              }
+              byteCode = 'no-size';
+              definitelyUnsupported = false;
+            } catch (e) {
+              byteCode = codeOf(e);
+              if (!isSeekFault(byteCode)) throw e;
+              if (byteCode !== '710') definitelyUnsupported = false;
+            }
+          } else {
+            definitelyUnsupported = false;
+          }
+
+          // Only a hard, definitive refusal (710 on every mode) hides the controls.
+          // Transient 701/711 failures fail silently — seeking just didn't take.
+          if (definitelyUnsupported) {
+            seekUnsupportedDevices.add(d.id);
+            setSeekSupported(false);
+            const detail = `time ${relCode ?? '—'}${triedByte ? `, byte ${byteCode ?? '—'}` : ''}`;
+            setError(`This TV doesn’t support seeking (${detail}).`);
+          }
+        } finally {
+          seekInFlightRef.current = false;
         }
       }),
     [runAction],
@@ -460,6 +579,9 @@ export function useCast(): UseCast {
   useEffect(() => {
     volumeRef.current = volume;
   }, [volume]);
+  useEffect(() => {
+    durationRef.current = duration;
+  }, [duration]);
 
   // Relative volume: read the current level once, then nudge it by `delta`
   // notches per press (was jumping to a fixed absolute level before, which
@@ -562,27 +684,25 @@ export function useCast(): UseCast {
           'playing';
   const pbDuration = signage ? sigDuration : duration;
   const pbControls = nowPlaying?.kind !== 'image';
+  const pbPosition = signage ? sigPosition : position;
 
-  // Current position via a ref so the notification effect doesn't re-fire on
-  // every poll tick — the MediaSession extrapolates the seek bar between updates.
-  const pbPositionRef = useRef(0);
-  useEffect(() => {
-    pbPositionRef.current = signage ? sigPosition : position;
-  }, [signage, sigPosition, position]);
-
+  // Re-sync the notification on every poll tick. The MediaSession extrapolates the
+  // seek bar between updates, but if we only re-present on state changes it drifts
+  // (the TV's real position vs. our 1× guess, esp. across buffering). Re-presenting
+  // each tick is cheap — present() updates the same notification id in place.
   useEffect(() => {
     if (castActive) {
       presentKeepAlive({
         title: pbTitle,
         state: pbState,
-        position: pbPositionRef.current,
+        position: pbPosition,
         duration: pbDuration,
         controls: pbControls,
       });
     } else {
       stopKeepAlive();
     }
-  }, [castActive, pbTitle, pbState, pbDuration, pbControls, seekNonce]);
+  }, [castActive, pbTitle, pbState, pbDuration, pbControls, pbPosition, seekNonce]);
 
   // Route notification / lock-screen controls to whichever path is active (DLNA
   // push vs the signage WebSocket). Held in a ref so the listener stays stable.
@@ -600,7 +720,7 @@ export function useCast(): UseCast {
       if (action === 'play') onPlay();
       else if (action === 'pause') onPause();
       else if (action === 'stop') onStop();
-      else if (action === 'seekBy') onSeek(Math.max(0, pbPositionRef.current + (value ?? 0)));
+      else if (action === 'seekBy') onSeek(Math.max(0, pbPosition + (value ?? 0)));
       else if (action === 'seekTo') onSeek(value ?? 0);
     }
   };
@@ -659,5 +779,11 @@ export function useCast(): UseCast {
     onVolumeStep,
     dismissError,
     dismissSignage,
+    castProgress,
+    canConvert: ffmpegAvailable,
+    converting,
+    convertProgress,
+    convertSelected,
+    cancelConversion,
   };
 }

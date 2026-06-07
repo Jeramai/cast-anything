@@ -15,6 +15,9 @@ import {
 import * as Network from 'expo-network';
 import { getWsPort } from '../ws/wsServer';
 import { sanitizeFileName } from './sanitize';
+import { contentFeatures } from '../dlna/avtransport';
+import type { MediaKind } from '../dlna/types';
+import { startMediaServer, setServedFile, MEDIA_PORT } from './mediaServer';
 
 /**
  * Serves locally-picked media over HTTP so a TV on the same Wi-Fi can stream it.
@@ -270,15 +273,60 @@ let lastShared: { localUri: string; destPath: string } | null = null;
  *   - `file://` (iOS import temp, or a real path): rename (instant, same volume)
  *     and fall back to a copy across volumes.
  */
-async function materialize(localUri: string, destPath: string): Promise<void> {
+async function fileSize(path: string): Promise<number> {
+  return (await stat(path).catch(() => null))?.size ?? 0;
+}
+
+/**
+ * copyFile() has no progress callback, so for large files we poll the growing
+ * destination size against the known source size and report a 0–1 fraction.
+ * Falls back to a plain copy when the size is unknown or no callback is given.
+ */
+async function copyWithProgress(
+  from: string,
+  destPath: string,
+  totalBytes: number,
+  onProgress?: (fraction: number) => void,
+): Promise<void> {
+  if (!onProgress || totalBytes <= 0) {
+    await copyFile(from, destPath);
+    return;
+  }
+  let done = false;
+  const timer = setInterval(() => {
+    if (done) return;
+    stat(destPath)
+      .then((s) => {
+        if (!done && s?.size) onProgress(Math.min(0.99, s.size / totalBytes));
+      })
+      .catch(() => {});
+  }, 350);
+  try {
+    await copyFile(from, destPath);
+  } finally {
+    done = true;
+    clearInterval(timer);
+  }
+  onProgress(1);
+}
+
+async function materialize(
+  localUri: string,
+  destPath: string,
+  onProgress?: (fraction: number) => void,
+  knownSize?: number,
+): Promise<void> {
   if (localUri.startsWith('content://')) {
+    // stat() rarely reports a size for content:// URIs, so prefer the size the
+    // file picker gave us — without it, progress can't be computed.
+    const total = knownSize || (await fileSize(localUri));
     try {
-      await copyFile(localUri, destPath);
+      await copyWithProgress(localUri, destPath, total, onProgress);
       return;
     } catch (e) {
       const real = (await stat(localUri).catch(() => null))?.originalFilepath;
       if (real && real !== localUri) {
-        await copyFile(real, destPath);
+        await copyWithProgress(real, destPath, total || (await fileSize(real)), onProgress);
         return;
       }
       throw new Error(
@@ -290,36 +338,51 @@ async function materialize(localUri: string, destPath: string): Promise<void> {
   try {
     await moveFile(fromPath, destPath); // instant rename when on the same volume
   } catch {
-    await copyFile(fromPath, destPath);
+    await copyWithProgress(fromPath, destPath, knownSize || (await fileSize(fromPath)), onProgress);
   }
 }
 
 /**
  * Place a picked local file into the served directory and return the URL the TV
- * should stream from. Replaces any previously shared file (we only cast one
- * item at a time, so this keeps the cache small). Re-casting the same item is a
- * no-op — the file is already in place.
+ * should stream from — served by our DLNA-aware media server (byte Range +
+ * TimeSeekRange), so Samsung renderers can seek. Replaces any previously shared
+ * file; re-casting the same item reuses the file in place.
  */
 export async function shareLocalFile(
   localUri: string,
   displayName: string,
+  opts: {
+    mime: string;
+    kind: MediaKind;
+    durationSec?: number;
+    size?: number;
+    onProgress?: (fraction: number) => void;
+  },
 ): Promise<string> {
-  const baseOrigin = await startFileServer();
-  await ensureShareDir();
+  // Media goes through our DLNA-aware server only. (Signage separately starts
+  // lighttpd for its player page via writePlayerPage — DLNA doesn't need it, so we
+  // don't couple casting to lighttpd here.)
+  await startMediaServer();
+  const ip = await getLanIp();
 
   const safeName = sanitizeFileName(displayName);
   const destPath = `${SHARE_DIR}/${safeName}`;
-  const url = `${baseOrigin}/${encodeURIComponent(safeName)}`;
+  const url = `http://${ip}:${MEDIA_PORT}/${encodeURIComponent(safeName)}`;
 
-  // Re-casting the same item: the file is already served — nothing to do.
-  if (lastShared?.localUri === localUri && (await exists(destPath))) {
-    return url;
+  // Re-casting the same item: the file is already materialized — skip the copy.
+  if (!(lastShared?.localUri === localUri && (await exists(destPath)))) {
+    await clearShareDir();
+    await materialize(localUri, destPath, opts.onProgress, opts.size);
+    lastShared = { localUri, destPath };
   }
 
-  // A different item: drop the previous one, then bring the picked file in.
-  await clearShareDir();
-  await materialize(localUri, destPath);
-
-  lastShared = { localUri, destPath };
+  // Register it with the media server (size + duration enable TimeSeekRange).
+  setServedFile({
+    path: destPath,
+    size: opts.size || (await fileSize(destPath)),
+    mime: opts.mime,
+    durationSec: opts.durationSec ?? 0,
+    features: contentFeatures(opts.kind),
+  });
   return url;
 }

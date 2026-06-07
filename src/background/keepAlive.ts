@@ -43,6 +43,22 @@ function getKeepAwake(): KeepAwake | null {
   return keepAwake;
 }
 
+// Independent tag for "keep the screen on while the app is open" — separate from
+// the cast-active tag, so the screen stays awake whenever either is in effect.
+const SCREEN_TAG = 'app-awake';
+
+/** Keep the screen from auto-locking while the app is foregrounded (or release it). */
+export async function setScreenAwake(on: boolean): Promise<void> {
+  const ka = getKeepAwake();
+  if (!ka) return;
+  try {
+    if (on) await ka.activateKeepAwakeAsync(SCREEN_TAG);
+    else await ka.deactivateKeepAwake(SCREEN_TAG);
+  } catch {
+    /* keep-awake not in this binary yet — no-op until rebuilt */
+  }
+}
+
 let active = false;
 
 /** Start or update the keep-alive + playback notification for an active cast. */
