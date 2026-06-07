@@ -87,6 +87,23 @@ for (const a of ACCENTS) {
 }
 console.log(`wrote ${ACCENTS.length} accent variants (opaque + adaptive fg)`);
 
+// ---- Notification status-bar icon (white silhouette on transparent) ----
+// Android tints the small icon, so it must be a single-color/alpha glyph. Lives in
+// the cast-keep-alive module's res so it survives `expo prebuild` (which wipes /android).
+const NOTIF_RES = "modules/cast-keep-alive/android/src/main/res";
+const NOTIF_DPIS = {
+  "drawable-mdpi": 24,
+  "drawable-hdpi": 36,
+  "drawable-xhdpi": 48,
+  "drawable-xxhdpi": 72,
+  "drawable-xxxhdpi": 96,
+};
+for (const [dir, px] of Object.entries(NOTIF_DPIS)) {
+  mkdirSync(`${NOTIF_RES}/${dir}`, { recursive: true });
+  render(svg(glyph({ paint: "#ffffff", scale: 0.92 })), px, `${NOTIF_RES}/${dir}/ic_stat_cast.png`);
+}
+console.log("wrote notification icon (ic_stat_cast) at 5 densities");
+
 // NOTE: the Android adaptive backgroundColor for every variant is white (#ffffff),
 // set in app.json. If you ever reintroduce a tinted tile, update app.json's
 // android.adaptiveIcon backgroundColor and each per-accent backgroundColor to match.

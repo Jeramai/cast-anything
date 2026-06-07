@@ -20,9 +20,16 @@ declare class CastKeepAliveModule extends NativeModule<CastKeepAliveEvents> {
     position: number,
     duration: number,
     controls: boolean,
+    artworkPath: string,
   ): void;
   /** Tear down the foreground service / end the background task. */
   stop(): void;
+  /**
+   * Ask the OS to exempt the app from battery optimization (Android), so the media
+   * server keeps serving with the screen off. Returns true if already exempt (no
+   * dialog); otherwise opens the system prompt and returns false. No-op on iOS.
+   */
+  requestIgnoreBatteryOptimizations(): boolean;
 }
 
 // `requireOptionalNativeModule` returns null when the native module isn't in the

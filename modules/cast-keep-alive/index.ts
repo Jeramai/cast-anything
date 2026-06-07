@@ -20,6 +20,7 @@ export function presentPlayback(info: PlaybackInfo): void {
       info.position,
       info.duration,
       info.controls,
+      info.artworkPath ?? '',
     );
   } catch {
     /* native module absent or threw */
@@ -32,6 +33,18 @@ export function stopPlayback(): void {
     CastKeepAlive?.stop();
   } catch {
     /* no-op */
+  }
+}
+
+/**
+ * Ask the OS to exempt the app from battery optimization (Android) so the media
+ * server keeps serving with the screen off. Returns true if already exempt.
+ */
+export function requestIgnoreBatteryOptimizations(): boolean {
+  try {
+    return CastKeepAlive?.requestIgnoreBatteryOptimizations() ?? true;
+  } catch {
+    return true; // module absent / iOS — don't nag
   }
 }
 

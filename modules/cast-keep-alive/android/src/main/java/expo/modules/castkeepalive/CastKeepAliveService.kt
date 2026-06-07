@@ -8,6 +8,8 @@ import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.net.wifi.WifiManager
 import android.os.Build
 import android.os.IBinder
@@ -39,6 +41,8 @@ class CastKeepAliveService : Service() {
   private var lastPosition = 0.0
   private var lastDuration = 0.0
   private var lastControls = true
+  private var lastArtPath = ""
+  private var lastArt: Bitmap? = null
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -58,6 +62,7 @@ class CastKeepAliveService : Service() {
           lastPosition = intent.getDoubleExtra(EXTRA_POSITION, lastPosition)
           lastDuration = intent.getDoubleExtra(EXTRA_DURATION, lastDuration)
           lastControls = intent.getBooleanExtra(EXTRA_CONTROLS, lastControls)
+          loadArtwork(intent.getStringExtra(EXTRA_ARTWORK) ?: "")
         }
       }
     }
@@ -66,7 +71,7 @@ class CastKeepAliveService : Service() {
     updateSession()
     val notification = buildNotification()
     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+      startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK)
     } else {
       startForeground(NOTIFICATION_ID, notification)
     }
@@ -136,7 +141,10 @@ class CastKeepAliveService : Service() {
       MediaMetadataCompat.Builder()
         .putString(MediaMetadataCompat.METADATA_KEY_TITLE, lastTitle)
         .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_TITLE, lastTitle)
+        .putString(MediaMetadataCompat.METADATA_KEY_DISPLAY_SUBTITLE, "Cast Anything")
         .putLong(MediaMetadataCompat.METADATA_KEY_DURATION, durationMs)
+        .putBitmap(MediaMetadataCompat.METADATA_KEY_ALBUM_ART, lastArt)
+        .putBitmap(MediaMetadataCompat.METADATA_KEY_ART, lastArt)
         .build(),
     )
 
@@ -163,15 +171,36 @@ class CastKeepAliveService : Service() {
     )
   }
 
+  // Decode the artwork JPEG (downsampled to ~512px to keep memory sane). Cached by
+  // path so re-presenting on every poll tick doesn't re-decode the same frame.
+  private fun loadArtwork(path: String) {
+    if (path == lastArtPath) return
+    lastArtPath = path
+    lastArt = null
+    if (path.isEmpty()) return
+    try {
+      val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+      BitmapFactory.decodeFile(path, bounds)
+      var sample = 1
+      while (bounds.outWidth / sample > 512 || bounds.outHeight / sample > 512) sample *= 2
+      lastArt = BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
+    } catch (e: Exception) {
+      lastArt = null
+    }
+  }
+
   // ---- Notification ----
 
   private fun buildNotification(): Notification {
     createChannel()
 
+    val statIcon = resources.getIdentifier("ic_stat_cast", "drawable", packageName)
     val builder = NotificationCompat.Builder(this, CHANNEL_ID)
       .setContentTitle(lastTitle)
       .setContentText(if (lastControls) "Casting to your device" else "Showing on your device")
-      .setSmallIcon(applicationInfo.icon)
+      .setSmallIcon(if (statIcon != 0) statIcon else applicationInfo.icon)
+      .setLargeIcon(lastArt) // video frame → MediaStyle artwork / colorized background
+      .setColorized(true)
       .setContentIntent(launchPendingIntent())
       .setOngoing(true)
       .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -240,6 +269,7 @@ class CastKeepAliveService : Service() {
     const val EXTRA_POSITION = "position"
     const val EXTRA_DURATION = "duration"
     const val EXTRA_CONTROLS = "controls"
+    const val EXTRA_ARTWORK = "artwork"
 
     const val STATE_PLAYING = "playing"
     const val STATE_PAUSED = "paused"

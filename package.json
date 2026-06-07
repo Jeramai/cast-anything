@@ -20,6 +20,7 @@
     "expo-status-bar": "~56.0.4",
     "expo-system-ui": "~56.0.5",
     "fast-xml-parser": "^5.8.0",
+    "fflate": "^0.8.3",
     "react": "19.2.3",
     "react-native": "0.85.3",
     "react-native-safe-area-context": "~5.7.0",

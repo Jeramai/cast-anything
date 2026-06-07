@@ -89,6 +89,8 @@ export function buildDidlMetadata(opts: {
   size?: number;
   /** Media duration in seconds — without it, Samsung rejects Seek as 701. */
   durationSec?: number;
+  /** Sidecar subtitle URL (.srt). Adds a subtitle res + Samsung sec:CaptionInfo. */
+  subtitleUrl?: string;
 }): string {
   const dlnaFlags = contentFeatures(opts.kind);
   const protocolInfo = `http-get:*:${opts.mime}:${dlnaFlags}`;
@@ -103,16 +105,26 @@ export function buildDidlMetadata(opts: {
   ]
     .filter(Boolean)
     .join(' ');
+  // Subtitle: a sidecar <res> with a subtitle protocolInfo plus Samsung's
+  // sec:CaptionInfoEx — between them most DLNA TVs pick up the .srt.
+  const sub =
+    opts.subtitleUrl && opts.kind === 'video'
+      ? `<res protocolInfo="http-get:*:text/srt:*">${escapeXml(opts.subtitleUrl)}</res>` +
+        `<sec:CaptionInfoEx sec:type="srt">${escapeXml(opts.subtitleUrl)}</sec:CaptionInfoEx>` +
+        `<sec:CaptionInfo sec:type="srt">${escapeXml(opts.subtitleUrl)}</sec:CaptionInfo>`
+      : '';
   return (
     '<DIDL-Lite ' +
     'xmlns="urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/" ' +
     'xmlns:dc="http://purl.org/dc/elements/1.1/" ' +
     'xmlns:upnp="urn:schemas-upnp-org:metadata-1-0/upnp/" ' +
+    'xmlns:sec="http://www.sec.co.kr/" ' +
     'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">' +
     '<item id="0" parentID="-1" restricted="1">' +
     `<dc:title>${escapeXml(opts.title)}</dc:title>` +
     `<upnp:class>${upnpClassFor(opts.kind)}</upnp:class>` +
     `<res ${resAttrs}>${escapeXml(opts.url)}</res>` +
+    sub +
     '</item>' +
     '</DIDL-Lite>'
   );
@@ -389,6 +401,7 @@ export async function castMedia(
     mime: string;
     size?: number;
     durationSec?: number;
+    subtitleUrl?: string;
   },
 ): Promise<void> {
   const metadata = buildDidlMetadata(opts);

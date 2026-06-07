@@ -1,16 +1,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-  <!-- Keep the process + Wi-Fi radio alive while serving a local file to the TV. -->
+  <!-- Keep the process + Wi-Fi radio alive while serving a local file to the TV.
+       mediaPlayback (not dataSync): the right type for a cast/MediaSession, and
+       not subject to dataSync's per-day time cap. The battery-optimization
+       exemption lets the media server keep serving with the screen off — Doze
+       otherwise defers the app's network after ~30 min and the TV drops. -->
   <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+  <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
   <uses-permission android:name="android.permission.WAKE_LOCK" />
   <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+  <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
   <application>
     <service
       android:name="expo.modules.castkeepalive.CastKeepAliveService"
       android:exported="false"
-      android:foregroundServiceType="dataSync" />
+      android:foregroundServiceType="mediaPlayback" />
   </application>
 
 </manifest>

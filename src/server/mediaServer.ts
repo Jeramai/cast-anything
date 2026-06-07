@@ -25,9 +25,20 @@ const CHUNK = 256 * 1024;
 
 let server: any = null;
 let current: ServedFile | null = null;
+let subtitle: ServedFile | null = null;
+let subtitleUrl: string | null = null;
+
+/** Path the subtitle is served at (routes here regardless of the video name). */
+export const SUBTITLE_PATH = '/subtitle.srt';
 
 export function setServedFile(f: ServedFile): void {
   current = f;
+}
+
+/** Attach (or clear) a subtitle file + its public URL, served at SUBTITLE_PATH. */
+export function setSubtitleFile(f: ServedFile | null, url: string | null): void {
+  subtitle = f;
+  subtitleUrl = url;
 }
 
 function sendStr(socket: any, data: string): Promise<void> {
@@ -99,8 +110,14 @@ async function handle(socket: any): Promise<void> {
     started = true;
 
     const req = parseHttpHead(buf.slice(0, headEnd).toString('latin1'));
-    const f = current;
+    const wantsSub = req.path.split('?')[0] === SUBTITLE_PATH;
+    const f = wantsSub ? subtitle : current;
     const plan = planResponse(req, f, new Date().toUTCString());
+    // Point Samsung renderers at the sidecar subtitle via the legacy HTTP header
+    // (the DIDL sec:CaptionInfoEx is the primary path; this is a belt-and-braces).
+    if (!wantsSub && subtitleUrl && plan.hasBody !== undefined && plan.status !== '404 Not Found') {
+      plan.headers['CaptionInfo.sec'] = subtitleUrl;
+    }
     await writeHead(socket, plan.status, plan.headers);
     if (plan.hasBody && f) await streamBytes(socket, f.path, plan.start, plan.end, () => alive, dead);
     socket.end();

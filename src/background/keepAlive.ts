@@ -1,6 +1,7 @@
 import {
   addTransportCommandListener,
   presentPlayback,
+  requestIgnoreBatteryOptimizations,
   stopPlayback,
   type PlaybackInfo,
   type TransportAction,
@@ -8,6 +9,25 @@ import {
 
 export { addTransportCommandListener };
 export type { PlaybackInfo, TransportAction };
+
+// Prompt for the battery-optimization exemption at most once per session — the
+// native side no-ops if already granted, but we don't want to re-open the system
+// dialog on every cast if the user dismissed it.
+let exemptionAsked = false;
+/**
+ * Ensure the app can keep serving in the background (screen off). Without the
+ * battery-optimization exemption, Doze defers our network after ~30 min and the
+ * TV loses the stream. Best-effort + no-ops if already exempt or on iOS.
+ */
+export function ensureBackgroundExemption(): void {
+  if (exemptionAsked) return;
+  exemptionAsked = true;
+  try {
+    requestIgnoreBatteryOptimizations();
+  } catch {
+    /* native module absent — nothing to do */
+  }
+}
 
 /**
  * Keep the phone serving while a cast is in progress, and show a playback

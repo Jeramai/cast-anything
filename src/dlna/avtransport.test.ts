@@ -89,6 +89,32 @@ describe("buildDidlMetadata", () => {
     expect(xml).toContain('duration="0:01:24"');
   });
 
+  test("adds a subtitle res + Samsung sec:CaptionInfo when a subtitleUrl is given", () => {
+    const xml = buildDidlMetadata({
+      url: "http://h/a.mp4",
+      title: "Clip",
+      kind: "video",
+      mime: "video/mp4",
+      subtitleUrl: "http://h/subtitle.srt",
+    });
+    expect(xml).toContain('xmlns:sec="http://www.sec.co.kr/"');
+    expect(xml).toContain('<res protocolInfo="http-get:*:text/srt:*">http://h/subtitle.srt</res>');
+    expect(xml).toContain('<sec:CaptionInfoEx sec:type="srt">http://h/subtitle.srt</sec:CaptionInfoEx>');
+  });
+
+  test("does not add subtitle elements for non-video or when absent", () => {
+    const noSub = buildDidlMetadata({ url: "http://h/a.mp4", title: "C", kind: "video", mime: "video/mp4" });
+    expect(noSub).not.toContain("CaptionInfo");
+    const img = buildDidlMetadata({
+      url: "http://h/p.jpg",
+      title: "P",
+      kind: "image",
+      mime: "image/jpeg",
+      subtitleUrl: "http://h/subtitle.srt",
+    });
+    expect(img).not.toContain("CaptionInfo");
+  });
+
   test("omits size/duration when absent, and never adds duration to an image", () => {
     const noMeta = buildDidlMetadata({ url: "http://h/a.mp4", title: "C", kind: "video", mime: "video/mp4" });
     expect(noMeta).not.toContain("size=");

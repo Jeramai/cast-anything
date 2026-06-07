@@ -17,7 +17,7 @@ import { getWsPort } from '../ws/wsServer';
 import { sanitizeFileName } from './sanitize';
 import { contentFeatures } from '../dlna/avtransport';
 import type { MediaKind } from '../dlna/types';
-import { startMediaServer, setServedFile, MEDIA_PORT } from './mediaServer';
+import { startMediaServer, setServedFile, setSubtitleFile, MEDIA_PORT, SUBTITLE_PATH } from './mediaServer';
 
 /**
  * Serves locally-picked media over HTTP so a TV on the same Wi-Fi can stream it.
@@ -385,4 +385,36 @@ export async function shareLocalFile(
     features: contentFeatures(opts.kind),
   });
   return url;
+}
+
+const SUBS_DIR = `${CachesDirectoryPath}/cast-subs`;
+
+/**
+ * Save subtitle text and serve it from the media server (at SUBTITLE_PATH),
+ * returning its URL. Kept in its own dir so a later cast's clearShareDir() — which
+ * wipes the video dir — doesn't delete it.
+ */
+export async function serveSubtitle(srt: string): Promise<string> {
+  await startMediaServer();
+  const ip = await getLanIp();
+  if (!(await exists(SUBS_DIR))) await mkdir(SUBS_DIR);
+  const path = `${SUBS_DIR}/subtitle.srt`;
+  await writeFile(path, srt, 'utf8');
+  const url = `http://${ip}:${MEDIA_PORT}${SUBTITLE_PATH}`;
+  setSubtitleFile(
+    {
+      path,
+      size: await fileSize(path),
+      mime: 'text/srt',
+      durationSec: 0,
+      features: 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00d00000000000000000000000000000',
+    },
+    url,
+  );
+  return url;
+}
+
+/** Detach any served subtitle. */
+export function clearServedSubtitle(): void {
+  setSubtitleFile(null, null);
 }

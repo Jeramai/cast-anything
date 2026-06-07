@@ -11,8 +11,10 @@ import {
 import {
   ActivityIndicator,
   Animated,
+  KeyboardAvoidingView,
   Modal,
   PanResponder,
+  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -383,6 +385,8 @@ function CastScreen() {
   const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [convertOpen, setConvertOpen] = useState(false);
+  const [subsOpen, setSubsOpen] = useState(false);
+  const [subLang, setSubLang] = useState("en");
   // Where a conversion's output goes: cache only, or also saved to the gallery.
   const [outMode, setOutMode] = useState<OutputMode>("cache");
 
@@ -475,6 +479,15 @@ function CastScreen() {
                 onPress={() => setConvertOpen(true)}
               />
             )}
+            {/* Subtitles — fetch an .srt from OpenSubtitles and attach it. Shown for
+                any video (local or URL); the chip below shows when one is attached. */}
+            <Button
+              icon="chatbox-ellipses"
+              title={cast.subtitle ? cast.subtitle.language.toUpperCase() : "Subs"}
+              variant={cast.subtitle ? "primary" : "secondary"}
+              disabled={cast.media?.kind !== "video"}
+              onPress={() => setSubsOpen(true)}
+            />
           </View>
           {cast.importing && (
             <Text style={styles.hint}>
@@ -652,8 +665,12 @@ function CastScreen() {
         animationType="fade"
         onRequestClose={() => setSettingsOpen(false)}
       >
-        <Pressable style={styles.modalBackdrop} onPress={() => setSettingsOpen(false)}>
-          <Pressable style={styles.modalCard} onPress={() => {}}>
+        <KeyboardAvoidingView
+          behavior={Platform.OS === "ios" ? "padding" : "height"}
+          style={styles.modalKav}
+        >
+          <Pressable style={styles.modalBackdrop} onPress={() => setSettingsOpen(false)}>
+            <Pressable style={styles.modalCard} onPress={() => {}}>
             <View style={styles.modalHeader}>
               <Text style={styles.modalTitle}>Theme</Text>
               <Pressable onPress={() => setSettingsOpen(false)} hitSlop={10}>
@@ -712,9 +729,24 @@ function CastScreen() {
                   </Pressable>
                 ))}
               </View>
+
+              <Text style={styles.themeLabel}>SUBDL API key</Text>
+              <TextInput
+                value={cast.subdlKey}
+                onChangeText={cast.setSubdlKey}
+                placeholder="Paste your SUBDL API key"
+                placeholderTextColor={C.textDim}
+                autoCapitalize="none"
+                autoCorrect={false}
+                style={styles.input}
+              />
+              <Text style={styles.hint}>
+                Free key from subdl.com (no login needed). Enables online subtitle search.
+              </Text>
             </ScrollView>
           </Pressable>
         </Pressable>
+        </KeyboardAvoidingView>
       </Modal>
 
       {/* ---- Convert dialog ---- */}
@@ -796,6 +828,87 @@ function CastScreen() {
                 }}
                 style={{ marginTop: 14 }}
               />
+            )}
+          </Pressable>
+        </Pressable>
+      </Modal>
+
+      {/* ---- Subtitles dialog ---- */}
+      <Modal
+        visible={subsOpen}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setSubsOpen(false)}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={() => setSubsOpen(false)}>
+          <Pressable style={styles.modalCard} onPress={() => {}}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Subtitles</Text>
+              <Pressable onPress={() => setSubsOpen(false)} hitSlop={10}>
+                <Ionicons name="close" size={22} color={C.textDim} />
+              </Pressable>
+            </View>
+
+            {cast.subtitle && (
+              <View style={styles.subActiveRow}>
+                <Ionicons name="checkmark-circle" size={16} color={C.good} />
+                <Text style={styles.subActiveText} numberOfLines={1}>
+                  {cast.subtitle.language.toUpperCase()} · {cast.subtitle.release}
+                </Text>
+                <Pressable onPress={cast.clearSubtitle} hitSlop={8}>
+                  <Ionicons name="close" size={16} color={C.textDim} />
+                </Pressable>
+              </View>
+            )}
+
+            {/* Manual file — always available, no account needed. */}
+            <Button
+              icon="document-attach"
+              title="Pick a subtitle file (.srt)"
+              variant="secondary"
+              disabled={cast.searchingSubs}
+              onPress={cast.pickSubtitle}
+            />
+
+            {/* Online search via SUBDL (needs the free API key from Settings). */}
+            {cast.subdlKey ? (
+              <>
+                <Text style={styles.themeLabel}>Search online</Text>
+                <View style={styles.themeRow}>
+                  {["en", "es", "fr", "de", "nl", "it", "pt"].map((l) => (
+                    <Pressable
+                      key={l}
+                      onPress={() => setSubLang(l)}
+                      style={[styles.outChip, subLang === l && styles.outChipOn]}
+                    >
+                      <Text style={[styles.outChipText, subLang === l && styles.outChipTextOn]}>
+                        {l.toUpperCase()}
+                      </Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Button
+                  icon="search"
+                  title="Search SUBDL"
+                  variant="primary"
+                  loading={cast.searchingSubs}
+                  onPress={() => cast.searchSubs(subLang)}
+                />
+                <ScrollView style={styles.subResults} showsVerticalScrollIndicator={false}>
+                  {cast.subResults.map((r) => (
+                    <Pressable key={r.url} style={styles.subResultRow} onPress={() => cast.attachSub(r)}>
+                      <Text style={styles.subResultTitle} numberOfLines={1}>
+                        {r.release}
+                      </Text>
+                      <Text style={styles.subResultMeta}>{r.language.toUpperCase()}</Text>
+                    </Pressable>
+                  ))}
+                </ScrollView>
+              </>
+            ) : (
+              <Text style={styles.hint}>
+                Add a SUBDL API key in Settings to search online, or pick a file above.
+              </Text>
             )}
           </Pressable>
         </Pressable>
@@ -988,6 +1101,25 @@ function makeStyles(C: ThemePalette) {
   mediaName: { color: C.text, fontSize: 14, flex: 1 },
   clearX: { color: C.textDim, fontSize: 16, fontWeight: "700" },
   pickRow: { flexDirection: "row", gap: 10 },
+  subActiveRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 8,
+    backgroundColor: C.accentDim,
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
+    marginBottom: 4,
+  },
+  subActiveText: { color: C.text, fontSize: 13, flex: 1 },
+  subResults: { maxHeight: 260, marginTop: 10 },
+  subResultRow: {
+    paddingVertical: 10,
+    borderTopWidth: StyleSheet.hairlineWidth,
+    borderTopColor: C.border,
+  },
+  subResultTitle: { color: C.text, fontSize: 14 },
+  subResultMeta: { color: C.textDim, fontSize: 12, marginTop: 2 },
   outChip: {
     paddingHorizontal: 11,
     paddingVertical: 5,
@@ -1111,6 +1243,7 @@ function makeStyles(C: ThemePalette) {
     borderColor: C.border,
     marginTop: 2,
   },
+  modalKav: { flex: 1 },
   modalBackdrop: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.6)",

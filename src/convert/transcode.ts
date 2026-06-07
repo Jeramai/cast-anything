@@ -52,6 +52,39 @@ export async function probeMedia(uri: string): Promise<MediaProbe> {
   };
 }
 
+/**
+ * Extract a single video frame at ~`atSec` to a JPEG and return its path (for the
+ * notification artwork). No -vf scale (this build has no libavfilter) — a full-res
+ * frame; the native side downsamples it. Returns null if FFmpeg is absent or fails.
+ */
+let thumbSeq = 0;
+let lastThumb: string | null = null;
+
+export async function extractThumbnail(uri: string, atSec: number): Promise<string | null> {
+  if (!ffmpegAvailable) return null;
+  try {
+    if (!(await exists(FFMPEG_DIR))) await mkdir(FFMPEG_DIR);
+    // Unique name each call — the native side caches artwork by path, so reusing
+    // one name would make it skip re-decoding the new frame.
+    const out = `${FFMPEG_DIR}/thumb-${thumbSeq++}.jpg`;
+    const input = await ffmpegInput(uri);
+    const args = ['-y', '-ss', String(Math.max(0, Math.floor(atSec))), '-i', input, '-frames:v', '1', '-an', out];
+    const result = await new Promise<string | null>((resolve) => {
+      FFmpegKit.executeWithArgumentsAsync(args, async (session) => {
+        const rc = await session.getReturnCode();
+        resolve(ReturnCode.isSuccess(rc) && (await exists(out)) ? out : null);
+      }).catch(() => resolve(null));
+    });
+    if (result) {
+      if (lastThumb) await unlink(lastThumb).catch(() => {});
+      lastThumb = result;
+    }
+    return result;
+  } catch {
+    return null;
+  }
+}
+
 let activeSessionId: number | null = null;
 
 /** Cancel an in-progress conversion, if any. */

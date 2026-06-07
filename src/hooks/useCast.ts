@@ -17,14 +17,29 @@ import {
 import { isUnreachableByLan, parseUrl } from '../dlna/url';
 import {
   addTransportCommandListener,
+  ensureBackgroundExemption,
   presentKeepAlive,
   stopKeepAlive,
   type PlaybackInfo,
   type TransportAction,
 } from '../background/keepAlive';
-import { shareLocalFile, writePlayerPage } from '../server/fileServer';
-import { convertForCast, cancelConvert, ffmpegAvailable, probeMedia } from '../convert/transcode';
+import {
+  shareLocalFile,
+  writePlayerPage,
+  serveSubtitle,
+  clearServedSubtitle,
+} from '../server/fileServer';
+import {
+  convertForCast,
+  cancelConvert,
+  ffmpegAvailable,
+  probeMedia,
+  extractThumbnail,
+} from '../convert/transcode';
 import { saveToGallery, type OutputMode } from '../convert/gallery';
+import { searchSubtitles, downloadSubtitle, type SubtitleResult } from '../subtitles/subdl';
+import { loadApiKey, saveApiKey } from '../subtitles/subtitleStore';
+import { pickSubtitleFile } from '../subtitles/pickSubtitle';
 import { startWsServer, wsSendControl } from '../ws/wsServer';
 import { castToSignage, type SignageCastResult } from '../signage/castSignage';
 
@@ -121,6 +136,24 @@ export interface UseCast {
   convertSelected: (mode?: OutputMode) => Promise<void>;
   /** Cancel an in-progress conversion. */
   cancelConversion: () => void;
+  // ---- Subtitles ----
+  /** Saved SUBDL API key (empty until the user sets one). */
+  subdlKey: string;
+  setSubdlKey: (k: string) => void;
+  /** Latest subtitle search results. */
+  subResults: SubtitleResult[];
+  /** True while searching, downloading, or reading a subtitle. */
+  searchingSubs: boolean;
+  /** The attached subtitle (language + release label), or null. */
+  subtitle: { language: string; release: string } | null;
+  /** Search SUBDL for the selected file in the given language code. */
+  searchSubs: (language: string) => Promise<void>;
+  /** Download + attach a SUBDL result; sent to the TV on the next cast. */
+  attachSub: (r: SubtitleResult) => Promise<void>;
+  /** Attach a subtitle from a local file the user picks. */
+  pickSubtitle: () => Promise<void>;
+  /** Detach the current subtitle. */
+  clearSubtitle: () => void;
 }
 
 export function useCast(): UseCast {
@@ -135,6 +168,16 @@ export function useCast(): UseCast {
   const [importing, setImporting] = useState(false);
   const [converting, setConverting] = useState(false);
   const [convertProgress, setConvertProgress] = useState(0);
+  // Subtitles (OpenSubtitles). subtitleUrlRef holds the served .srt URL passed to
+  // the renderer at cast time; `subtitle` is the attached label for the UI.
+  const [subdlKey, setSubdlKeyState] = useState('');
+  const [subResults, setSubResults] = useState<SubtitleResult[]>([]);
+  const [searchingSubs, setSearchingSubs] = useState(false);
+  const [subtitle, setSubtitle] = useState<{ language: string; release: string } | null>(null);
+  const subtitleUrlRef = useRef<string | null>(null);
+  // A video frame used as the notification artwork (extracted once per cast).
+  const artworkPathRef = useRef<string | null>(null);
+  const [artworkNonce, setArtworkNonce] = useState(0);
   // Non-null while a large local file is being copied into the server dir before
   // the DLNA hand-off (0–1). Null when there's nothing to copy (remote/instant move).
   const [castProgress, setCastProgress] = useState<number | null>(null);
@@ -233,6 +276,16 @@ export function useCast(): UseCast {
     setSeekSupported(!seekUnsupportedDevices.has(d.id));
   }, []);
 
+  // Detach any subtitle (called when a different item is chosen — the subtitle
+  // was matched to the old one).
+  const clearSubtitle = useCallback(() => {
+    subtitleUrlRef.current = null;
+    setSubtitle(null);
+    setSubResults([]);
+    clearServedSubtitle();
+    artworkPathRef.current = null; // also drop the old item's notification frame
+  }, []);
+
   const chooseFile = useCallback(async () => {
     setError(null);
     // The OS picker copies the chosen file into our cache before resolving; for
@@ -241,21 +294,31 @@ export function useCast(): UseCast {
     setImporting(true);
     try {
       const item = await pickMedia();
-      if (item) setMedia(item);
+      if (item) {
+        setMedia(item);
+        clearSubtitle();
+      }
     } catch (e) {
       setError(errMessage(e));
     } finally {
       setImporting(false);
     }
-  }, []);
+  }, [clearSubtitle]);
 
-  const chooseUrl = useCallback((url: string) => {
-    if (!url.trim()) return;
-    setError(null);
-    setMedia(mediaFromUrl(url));
-  }, []);
+  const chooseUrl = useCallback(
+    (url: string) => {
+      if (!url.trim()) return;
+      setError(null);
+      setMedia(mediaFromUrl(url));
+      clearSubtitle();
+    },
+    [clearSubtitle],
+  );
 
-  const clearMedia = useCallback(() => setMedia(null), []);
+  const clearMedia = useCallback(() => {
+    setMedia(null);
+    clearSubtitle();
+  }, [clearSubtitle]);
 
   // Convert the selected local file into a TV-friendly MP4 (remux + AAC), then
   // swap it in as the selection so a normal Cast press streams the converted file.
@@ -290,6 +353,69 @@ export function useCast(): UseCast {
     cancelConvert();
   }, []);
 
+  // ---- Subtitles ----
+  useEffect(() => {
+    loadApiKey().then(setSubdlKeyState);
+  }, []);
+
+  const setSubdlKey = useCallback((k: string) => {
+    setSubdlKeyState(k);
+    saveApiKey(k);
+  }, []);
+
+  /** Search SUBDL for the selected file (by name) in `language`. */
+  const searchSubs = useCallback(
+    async (language: string) => {
+      if (!media) return;
+      setError(null);
+      setSearchingSubs(true);
+      try {
+        const query = media.name.replace(/\.[^.]+$/, '');
+        setSubResults(await searchSubtitles(subdlKey, query, language));
+      } catch (e) {
+        setSubResults([]);
+        setError(errMessage(e));
+      } finally {
+        setSearchingSubs(false);
+      }
+    },
+    [media, subdlKey],
+  );
+
+  /** Download a chosen SUBDL result (.zip → .srt) and serve it for the next cast. */
+  const attachSub = useCallback(async (r: SubtitleResult) => {
+    setError(null);
+    setSearchingSubs(true);
+    try {
+      const srt = await downloadSubtitle(r.url);
+      subtitleUrlRef.current = await serveSubtitle(srt);
+      setSubtitle({ language: r.language, release: r.release });
+      setSubResults([]);
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setSearchingSubs(false);
+    }
+  }, []);
+
+  /** Attach a subtitle from a local file the user picks (no account needed). */
+  const pickSubtitle = useCallback(async () => {
+    setError(null);
+    setSearchingSubs(true);
+    try {
+      const picked = await pickSubtitleFile();
+      if (picked) {
+        subtitleUrlRef.current = await serveSubtitle(picked.content);
+        setSubtitle({ language: 'file', release: picked.name });
+        setSubResults([]);
+      }
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setSearchingSubs(false);
+    }
+  }, []);
+
   const cast = useCallback(async () => {
     if (!selectedDevice) {
       setError('Pick a TV / device first.');
@@ -318,6 +444,10 @@ export function useCast(): UseCast {
     }
 
     try {
+      // Serving a local file needs the app to keep running with the screen off —
+      // ask for the battery-optimization exemption (once) so Doze doesn't drop it.
+      if (media.isLocal) ensureBackgroundExemption();
+
       // Probe the duration up front (best-effort, local files) so BOTH the media
       // server (TimeSeekRange → byte mapping) and the DIDL <res> can advertise a
       // seekable timeline — Samsung rejects Seek with 701 without it.
@@ -328,6 +458,18 @@ export function useCast(): UseCast {
         } catch {
           /* duration is best-effort */
         }
+      }
+
+      // Grab a representative frame for the notification artwork (async, best-effort)
+      // — the next poll-driven present (bumped by artworkNonce) picks it up.
+      if (media.isLocal && media.kind === 'video' && ffmpegAvailable) {
+        const at = durationSec > 0 ? Math.min(durationSec * 0.3, 120) : 5;
+        extractThumbnail(media.uri, at).then((p) => {
+          if (p) {
+            artworkPathRef.current = p;
+            setArtworkNonce((n) => n + 1);
+          }
+        });
       }
 
       const url = media.isLocal
@@ -381,6 +523,7 @@ export function useCast(): UseCast {
         mime: media.mime,
         size: media.size,
         durationSec: durationSec || undefined,
+        subtitleUrl: subtitleUrlRef.current ?? undefined,
       });
       setNowPlaying(media);
       setStatus('PLAYING');
@@ -698,11 +841,12 @@ export function useCast(): UseCast {
         position: pbPosition,
         duration: pbDuration,
         controls: pbControls,
+        artworkPath: artworkPathRef.current ?? undefined,
       });
     } else {
       stopKeepAlive();
     }
-  }, [castActive, pbTitle, pbState, pbDuration, pbControls, pbPosition, seekNonce]);
+  }, [castActive, pbTitle, pbState, pbDuration, pbControls, pbPosition, seekNonce, artworkNonce]);
 
   // Route notification / lock-screen controls to whichever path is active (DLNA
   // push vs the signage WebSocket). Held in a ref so the listener stays stable.
@@ -785,5 +929,14 @@ export function useCast(): UseCast {
     convertProgress,
     convertSelected,
     cancelConversion,
+    subdlKey,
+    setSubdlKey,
+    subResults,
+    searchingSubs,
+    subtitle,
+    searchSubs,
+    attachSub,
+    pickSubtitle,
+    clearSubtitle,
   };
 }

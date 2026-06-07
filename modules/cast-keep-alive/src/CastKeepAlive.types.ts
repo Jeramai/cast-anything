@@ -11,6 +11,8 @@ export interface PlaybackInfo {
   duration: number;
   /** False for photos — show no transport controls / seek bar. */
   controls: boolean;
+  /** Local path to a frame/thumbnail JPEG, shown as the notification artwork. */
+  artworkPath?: string;
 }
 
 /** A control the user triggered from the notification / lock screen. */
