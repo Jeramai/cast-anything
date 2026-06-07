@@ -71,8 +71,6 @@ import {
 
 const SCAN_MS = 6000;
 const POLL_MS = 1500;
-/** One notch per press, like a TV remote (0–100 scale). */
-const VOLUME_STEP = 1;
 
 // Devices that rejected every seek mode (e.g. Samsung "The Freestyle" advertises
 // Seek but its renderer refuses it for pushed content). Remembered by device id
