@@ -69,7 +69,15 @@ function upnpClassFor(kind: MediaKind): string {
  *     here AND the server actually answers TimeSeekRange — which our media server does.
  *   image → OP=00 (no seek); advertising seek flags on a photo makes Samsung 402.
  */
-export function contentFeatures(kind: MediaKind): string {
+export function contentFeatures(kind: MediaKind, live = false): string {
+  // Live stream (HLS): the source is sender-paced and infinite, so neither
+  // time- nor byte-seek applies (OP=00). FLAGS sets sp_flag (sender paced),
+  // s0/sN_increasing (the timeline grows) and the streaming transfer mode —
+  // the canonical "live TV" profile. Advertising VOD seek flags here makes
+  // Samsung reject the stream.
+  if (live) {
+    return 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8d500000000000000000000000000000';
+  }
   return kind === 'image'
     ? 'DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00f00000000000000000000000000000'
     : 'DLNA.ORG_OP=11;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000';
@@ -91,15 +99,20 @@ export function buildDidlMetadata(opts: {
   durationSec?: number;
   /** Sidecar subtitle URL (.srt). Adds a subtitle res + Samsung sec:CaptionInfo. */
   subtitleUrl?: string;
+  /** Live HLS stream — infinite/non-seekable; uses the live DLNA flags. */
+  live?: boolean;
 }): string {
-  const dlnaFlags = contentFeatures(opts.kind);
+  const live = opts.live === true;
+  const dlnaFlags = contentFeatures(opts.kind, live);
   const protocolInfo = `http-get:*:${opts.mime}:${dlnaFlags}`;
   // A seekable timeline needs a duration on the <res>; without it Samsung answers
   // Seek with 701 "not available". size lets the renderer map time → byte range.
+  // A live stream has neither a known size nor a duration — emitting them would
+  // tell the TV the stream is finite/seekable, which it isn't.
   const resAttrs = [
     `protocolInfo="${protocolInfo}"`,
-    opts.size && opts.size > 0 ? `size="${Math.floor(opts.size)}"` : '',
-    opts.durationSec && opts.durationSec > 0 && opts.kind !== 'image'
+    !live && opts.size && opts.size > 0 ? `size="${Math.floor(opts.size)}"` : '',
+    !live && opts.durationSec && opts.durationSec > 0 && opts.kind !== 'image'
       ? `duration="${secondsToHms(opts.durationSec)}"`
       : '',
   ]
@@ -122,7 +135,9 @@ export function buildDidlMetadata(opts: {
     'xmlns:dlna="urn:schemas-dlna-org:metadata-1-0/">' +
     '<item id="0" parentID="-1" restricted="1">' +
     `<dc:title>${escapeXml(opts.title)}</dc:title>` +
-    `<upnp:class>${upnpClassFor(opts.kind)}</upnp:class>` +
+    // Live video advertises the videoBroadcast class so the TV treats it as a
+    // live channel (no scrub bar) rather than a finite videoItem.
+    `<upnp:class>${live && opts.kind === 'video' ? 'object.item.videoItem.videoBroadcast' : upnpClassFor(opts.kind)}</upnp:class>` +
     `<res ${resAttrs}>${escapeXml(opts.url)}</res>` +
     sub +
     '</item>' +
@@ -402,6 +417,7 @@ export async function castMedia(
     size?: number;
     durationSec?: number;
     subtitleUrl?: string;
+    live?: boolean;
   },
 ): Promise<void> {
   const metadata = buildDidlMetadata(opts);

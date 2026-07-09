@@ -14,6 +14,8 @@ class CastKeepAliveModule extends NativeModule<CastKeepAliveEvents> {
     _position: number,
     _duration: number,
     _controls: boolean,
+    _artworkPath?: string,
+    _volume?: number,
   ): void {}
   stop(): void {}
 }

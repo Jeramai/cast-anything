@@ -138,4 +138,28 @@ describe("contentFeatures", () => {
   test("image is non-seekable (OP=00)", () => {
     expect(contentFeatures("image")).toContain("DLNA.ORG_OP=00");
   });
+  test("live stream is non-seekable with sender-paced flags", () => {
+    const f = contentFeatures("video", true);
+    expect(f).toContain("DLNA.ORG_OP=00");
+    expect(f).toContain("DLNA.ORG_FLAGS=8d50");
+  });
+});
+
+describe("buildDidlMetadata (live HLS)", () => {
+  test("uses videoBroadcast class and omits duration/size", () => {
+    const xml = buildDidlMetadata({
+      url: "http://h/game.m3u8",
+      title: "Ballgame",
+      kind: "video",
+      mime: "application/vnd.apple.mpegurl",
+      // Even if a stray size/duration is passed, a live item must not advertise them.
+      size: 123,
+      durationSec: 999,
+      live: true,
+    });
+    expect(xml).toContain("object.item.videoItem.videoBroadcast");
+    expect(xml).toContain("DLNA.ORG_FLAGS=8d50");
+    expect(xml).not.toContain("duration=");
+    expect(xml).not.toContain("size=");
+  });
 });

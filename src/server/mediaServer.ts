@@ -1,9 +1,29 @@
 import TcpSocket from 'react-native-tcp-socket';
 import { Buffer } from 'buffer';
-import { read } from '@dr.pogodin/react-native-fs';
-import { parseHttpHead, planResponse, type ServedFile } from './dlnaHttp';
+import { read, stat } from '@dr.pogodin/react-native-fs';
+import { parseHttpHead, planLiveResponse, planResponse, type ServedFile } from './dlnaHttp';
 
 export type { ServedFile };
+
+/**
+ * A live, unbounded stream (our HLS→MPEG-TS remux). Unlike a {@link ServedFile} it
+ * has no size or seek — the server just pulls complete segments via `next()` and
+ * deletes each one through `done()` once it's been sent.
+ */
+export interface LiveSource {
+  mime: string;
+  /** `contentFeatures.dlna.org` value (must carry the live flags). */
+  features: string;
+  /** Next complete segment path, or null once the feed has ended. */
+  next: (alive: () => boolean) => Promise<string | null>;
+  /** Called after a segment has been fully sent — delete it. */
+  done: (path: string) => void;
+  /** Stop producing (cast stopped / superseded). */
+  stop: () => void;
+}
+
+/** Path the live remux is served at (any query is ignored). */
+export const LIVE_PATH = '/live.ts';
 
 /**
  * A small DLNA-aware HTTP file server for casting local media.
@@ -27,12 +47,18 @@ let server: any = null;
 let current: ServedFile | null = null;
 let subtitle: ServedFile | null = null;
 let subtitleUrl: string | null = null;
+let live: LiveSource | null = null;
 
 /** Path the subtitle is served at (routes here regardless of the video name). */
 export const SUBTITLE_PATH = '/subtitle.srt';
 
 export function setServedFile(f: ServedFile): void {
   current = f;
+}
+
+/** Attach (or clear) the live stream served at {@link LIVE_PATH}. */
+export function setLiveSource(s: LiveSource | null): void {
+  live = s;
 }
 
 /** Attach (or clear) a subtitle file + its public URL, served at SUBTITLE_PATH. */
@@ -86,6 +112,26 @@ async function streamBytes(
   }
 }
 
+/**
+ * Stream a live source as one continuous body: pull complete segments in order,
+ * send each, then delete it. Ends when the source is exhausted (next → null) or
+ * the renderer disconnects (alive() → false).
+ */
+async function streamLive(
+  socket: any,
+  src: LiveSource,
+  alive: () => boolean,
+  dead: Promise<void>,
+): Promise<void> {
+  while (alive()) {
+    const seg = await src.next(alive);
+    if (seg == null || !alive()) break;
+    const size = (await stat(seg).catch(() => null))?.size ?? 0;
+    if (size > 0) await streamBytes(socket, seg, 0, size - 1, alive, dead);
+    src.done(seg);
+  }
+}
+
 async function handle(socket: any): Promise<void> {
   let buf = Buffer.alloc(0);
   let started = false;
@@ -110,6 +156,16 @@ async function handle(socket: any): Promise<void> {
     started = true;
 
     const req = parseHttpHead(buf.slice(0, headEnd).toString('latin1'));
+
+    // Live stream (HLS→MPEG-TS remux): no size, no seek — stream until it ends.
+    if (req.path.split('?')[0] === LIVE_PATH) {
+      const plan = planLiveResponse(req, live, new Date().toUTCString());
+      await writeHead(socket, plan.status, plan.headers);
+      if (plan.hasBody && live) await streamLive(socket, live, () => alive, dead);
+      socket.end();
+      return;
+    }
+
     const wantsSub = req.path.split('?')[0] === SUBTITLE_PATH;
     const f = wantsSub ? subtitle : current;
     const plan = planResponse(req, f, new Date().toUTCString());

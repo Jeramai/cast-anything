@@ -9,7 +9,7 @@
     "userInterfaceStyle": "dark",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.castanything.app",
+      "bundleIdentifier": "ai.jeram.castanything",
       "infoPlist": {
         "NSLocalNetworkUsageDescription": "Cast Anything finds TVs and media players on your Wi-Fi network so you can cast media to them.",
         "NSAppTransportSecurity": {
@@ -22,7 +22,7 @@
       }
     },
     "android": {
-      "package": "com.castanything.app",
+      "package": "ai.jeram.castanything",
       "adaptiveIcon": {
         "backgroundColor": "#ffffff",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -174,7 +174,8 @@
             }
           }
         }
-      ]
+      ],
+      "./plugins/withReleaseSigning"
     ]
   }
 }

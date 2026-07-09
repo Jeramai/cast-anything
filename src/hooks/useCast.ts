@@ -28,6 +28,8 @@ import {
   writePlayerPage,
   serveSubtitle,
   clearServedSubtitle,
+  serveLiveStream,
+  stopLiveStream,
 } from '../server/fileServer';
 import {
   convertForCast,
@@ -71,6 +73,11 @@ import {
 
 const SCAN_MS = 6000;
 const POLL_MS = 1500;
+// How close to the duration (seconds) counts as "the end". Some renderers
+// (notably Samsung) don't report STOPPED when a video finishes — they keep
+// reporting PLAYING with the clock frozen at the last second. We treat a
+// non-advancing position within this window of the end as end-of-media.
+const END_EPSILON_S = 2;
 
 // Devices that rejected every seek mode (e.g. Samsung "The Freestyle" advertises
 // Seek but its renderer refuses it for pushed content). Remembered by device id
@@ -206,6 +213,11 @@ export function useCast(): UseCast {
   const discoveryRef = useRef<{ stop: () => void } | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // End-of-media detection state for the poll loop: the position seen on the
+  // previous tick (to spot a frozen clock), and whether playback ever actually
+  // started (so a spurious STOPPED *before* the first frame can't end the cast).
+  const prevPollPosRef = useRef(-1);
+  const playbackSeenRef = useRef(false);
   // Mirror of `status` for callbacks that need the latest value without being
   // re-created (e.g. onSeek deciding whether to resume after a pause-seek).
   const statusRef = useRef<PlaybackStatus>('IDLE');
@@ -218,9 +230,23 @@ export function useCast(): UseCast {
     }
   }, []);
 
+  // The video finished on the TV (or was stopped by its own remote): drop the
+  // notification, hide the Now-Playing sheet, and stop any on-device remux so
+  // FFmpeg isn't left running. Mirrors onStop, minus the DLNA Stop call (the TV
+  // has already stopped itself).
+  const finishPlayback = useCallback(() => {
+    stopPolling();
+    setStatus('STOPPED'); // → castActive becomes false → keep-alive/notification torn down
+    setPosition(0);
+    setNowPlaying(null);
+    stopLiveStream().catch(() => {});
+  }, [stopPolling]);
+
   const startPolling = useCallback(
     (device: DlnaDevice) => {
       stopPolling();
+      prevPollPosRef.current = -1;
+      playbackSeenRef.current = false;
       pollRef.current = setInterval(async () => {
         try {
           const [transport, pos] = await Promise.all([
@@ -234,18 +260,39 @@ export function useCast(): UseCast {
           setStatus(transport.state);
           setPosition(pos.position);
           setDuration(pos.duration);
+
           if (
-            transport.state === 'STOPPED' ||
-            transport.state === 'NO_MEDIA_PRESENT'
+            transport.state === 'PLAYING' ||
+            transport.state === 'PAUSED_PLAYBACK' ||
+            transport.state === 'TRANSITIONING'
           ) {
-            stopPolling();
+            playbackSeenRef.current = true;
+          }
+
+          // End-of-media takes two shapes: the renderer reports a terminal
+          // transport state, OR it keeps saying PLAYING with the clock frozen at
+          // the very end (Samsung). Catch the latter via a non-advancing position
+          // within END_EPSILON_S of the duration. A genuine pause near the end
+          // isn't "ended", so the frozen-clock case is restricted to PLAYING.
+          const terminal =
+            transport.state === 'STOPPED' ||
+            transport.state === 'NO_MEDIA_PRESENT';
+          const frozenAtEnd =
+            transport.state === 'PLAYING' &&
+            pos.duration > 0 &&
+            pos.position >= pos.duration - END_EPSILON_S &&
+            pos.position === prevPollPosRef.current;
+          prevPollPosRef.current = pos.position;
+
+          if ((terminal || frozenAtEnd) && playbackSeenRef.current) {
+            finishPlayback();
           }
         } catch {
           /* transient network blip; keep polling */
         }
       }, POLL_MS);
     },
-    [stopPolling],
+    [stopPolling, finishPlayback],
   );
 
   const scan = useCallback(() => {
@@ -441,14 +488,26 @@ export function useCast(): UseCast {
       return;
     }
 
+    // A live HLS stream can't be pushed to most DLNA TVs as-is. When FFmpeg is
+    // present (Android) we remux it on-device into a continuous MPEG-TS feed the
+    // TV can play; otherwise we hand the TV the HLS URL directly (step-1 path,
+    // works on the sets that natively support HLS).
+    const usingRemux = media.live === true && ffmpegAvailable;
+    const servedFromPhone = media.isLocal || usingRemux;
+
     try {
-      // Serving a local file needs the app to keep running with the screen off —
+      // A prior cast may have left a live remux running; tear it down unless we're
+      // about to start a fresh one (serveLiveStream supersedes it on its own).
+      if (!usingRemux) await stopLiveStream();
+
+      // Serving from the phone needs the app to keep running with the screen off —
       // ask for the battery-optimization exemption (once) so Doze doesn't drop it.
-      if (media.isLocal) ensureBackgroundExemption();
+      if (servedFromPhone) ensureBackgroundExemption();
 
       // Probe the duration up front (best-effort, local files) so BOTH the media
       // server (TimeSeekRange → byte mapping) and the DIDL <res> can advertise a
-      // seekable timeline — Samsung rejects Seek with 701 without it.
+      // seekable timeline — Samsung rejects Seek with 701 without it. Live streams
+      // have no duration, so skip it for them.
       let durationSec = 0;
       if (media.isLocal && ffmpegAvailable) {
         try {
@@ -470,41 +529,53 @@ export function useCast(): UseCast {
         });
       }
 
-      const url = media.isLocal
-        ? await shareLocalFile(media.uri, media.name, {
-            mime: media.mime,
-            kind: media.kind,
-            durationSec: durationSec || undefined,
-            size: media.size,
-            onProgress: setCastProgress,
-          })
-        : media.uri;
+      // The MIME we advertise to the TV: for a remux it's the MPEG-TS feed we now
+      // serve, not the original playlist's `application/vnd.apple.mpegurl`.
+      let castMime = media.mime;
+      let url: string;
+      if (media.isLocal) {
+        url = await shareLocalFile(media.uri, media.name, {
+          mime: media.mime,
+          kind: media.kind,
+          durationSec: durationSec || undefined,
+          size: media.size,
+          onProgress: setCastProgress,
+        });
+      } else if (usingRemux) {
+        url = await serveLiveStream(media.uri);
+        castMime = 'video/mp2t';
+      } else {
+        url = media.uri;
+      }
       lastServedUrlRef.current = url; // for the byte-seek fallback
 
       console.log('[DLNA] casting', {
         url,
-        mime: media.mime,
+        mime: castMime,
         kind: media.kind,
+        live: media.live === true,
+        remux: usingRemux,
         device: selectedDevice.friendlyName,
         control: selectedDevice.avTransportControlURL,
       });
 
-      if (media.isLocal) {
+      if (servedFromPhone) {
         // An emulator's NAT address (or loopback) is reachable by this app but
-        // NOT by the TV, so local-file casting can't work there.
+        // NOT by the TV, so serving from the phone can't work there.
         const { host } = parseUrl(url);
         if (isUnreachableByLan(host)) {
           throw new Error(
             `The TV can't reach this device at ${host}. You're likely on an ` +
               `emulator — run on a physical phone on the same Wi-Fi as the TV ` +
-              `(or cast a public URL instead of a local file).`,
+              `(or cast a public URL instead).`,
           );
         }
-        // Confirm the phone is actually serving the file before involving the TV.
+        // Confirm the phone is actually serving before involving the TV. (HEAD on
+        // the live path returns headers only — it doesn't consume any segments.)
         try {
           const probe = await fetch(url, { method: 'HEAD' });
           if (!probe.ok) {
-            console.warn('[DLNA] file server HEAD', probe.status, url);
+            console.warn('[DLNA] media server HEAD', probe.status, url);
           }
         } catch (e) {
           throw new Error(
@@ -518,21 +589,27 @@ export function useCast(): UseCast {
         url,
         title: media.name,
         kind: media.kind,
-        mime: media.mime,
+        mime: castMime,
         size: media.size,
         durationSec: durationSec || undefined,
         subtitleUrl: subtitleUrlRef.current ?? undefined,
+        live: media.live === true,
       });
       setNowPlaying(media);
       setStatus('PLAYING');
       setPosition(0);
       setDuration(0);
-      setSeekSupported(!seekUnsupportedDevices.has(selectedDevice.id));
+      // A live stream has no timeline to scrub, so don't offer seek for it.
+      setSeekSupported(
+        !media.live && !seekUnsupportedDevices.has(selectedDevice.id),
+      );
       startPolling(selectedDevice);
       // Photos have no volume; only sync it for audio/video.
       if (media.kind !== 'image') refreshVolume(selectedDevice);
     } catch (e) {
       const msg = errMessage(e);
+      // A live remux that never reached playback is just burning CPU — stop it.
+      if (usingRemux) stopLiveStream().catch(() => {});
       // DLNA push rejected (UPnP 402) — the device may be signage we didn't
       // flag. Fall back to the MDC / URL Launcher path.
       if (/\b402\b/.test(msg) && selectedDevice.address) {
@@ -599,6 +676,9 @@ export function useCast(): UseCast {
         setPosition(0);
         setNowPlaying(null);
         stopPolling();
+        // Stop the on-device remux (if this was a live stream) so FFmpeg isn't
+        // left running after the TV has stopped.
+        stopLiveStream().catch(() => {});
       }),
     [runAction, stopPolling],
   );
@@ -739,6 +819,19 @@ export function useCast(): UseCast {
     [runAction],
   );
 
+  // Absolute volume set — used by the phone's hardware volume keys, which the
+  // native MediaSession routes here as a computed target (0–100) rather than a
+  // relative nudge, so the on-phone volume slider and the TV stay in lock-step.
+  const onVolumeSet = useCallback(
+    (v: number) =>
+      runAction(async (d) => {
+        const next = Math.max(0, Math.min(100, Math.round(v)));
+        await setVolume(d, next);
+        setVol(next);
+      }),
+    [runAction],
+  );
+
   const dismissError = useCallback(() => setError(null), []);
   const dismissSignage = useCallback(() => {
     setSignage(null);
@@ -840,11 +933,14 @@ export function useCast(): UseCast {
         duration: pbDuration,
         controls: pbControls,
         artworkPath: artworkPathRef.current ?? undefined,
+        // Keep the native volume provider in sync with the TV so the phone's
+        // hardware-key volume slider reflects the real level (-1 = unknown).
+        volume: volume ?? -1,
       });
     } else {
       stopKeepAlive();
     }
-  }, [castActive, pbTitle, pbState, pbDuration, pbControls, pbPosition, seekNonce, artworkNonce]);
+  }, [castActive, pbTitle, pbState, pbDuration, pbControls, pbPosition, volume, seekNonce, artworkNonce]);
 
   // Route notification / lock-screen controls to whichever path is active (DLNA
   // push vs the signage WebSocket). Held in a ref so the listener stays stable.
@@ -858,12 +954,14 @@ export function useCast(): UseCast {
       else if (action === 'stop') sigPause(); // signage has no hard stop — pause
       else if (action === 'seekBy') sigSeek(value ?? 0);
       else if (action === 'seekTo') sigSeekTo(value ?? 0);
+      // 'volumeTo' ignored — signage panels have no volume channel.
     } else {
       if (action === 'play') onPlay();
       else if (action === 'pause') onPause();
       else if (action === 'stop') onStop();
       else if (action === 'seekBy') onSeek(Math.max(0, pbPosition + (value ?? 0)));
       else if (action === 'seekTo') onSeek(value ?? 0);
+      else if (action === 'volumeTo') onVolumeSet(value ?? 0);
     }
   };
   useEffect(() => {

@@ -12,7 +12,16 @@ export interface MediaItem {
   size?: number;
   /** True when `uri` is a local file that must be served over HTTP. */
   isLocal: boolean;
+  /**
+   * True for a live stream (HLS `.m3u8`): infinite, non-seekable, and the
+   * renderer needs live DLNA flags instead of VOD seek flags. See
+   * {@link isHlsMime} and the `live` branch of avtransport's contentFeatures.
+   */
+  live?: boolean;
 }
+
+/** Apple HLS playlist MIME — the canonical one Samsung/DLNA renderers expect. */
+export const HLS_MIME = 'application/vnd.apple.mpegurl';
 
 const EXT_TO_MIME: Record<string, string> = {
   // video
@@ -23,6 +32,7 @@ const EXT_TO_MIME: Record<string, string> = {
   avi: 'video/x-msvideo',
   webm: 'video/webm',
   ts: 'video/mp2t',
+  m3u8: HLS_MIME,
   // audio
   mp3: 'audio/mpeg',
   m4a: 'audio/mp4',
@@ -53,6 +63,11 @@ export function kindFromMime(mime: string): MediaKind {
   return 'video';
 }
 
+/** True for an HLS playlist MIME (`application/vnd.apple.mpegurl`, `x-mpegURL`). */
+export function isHlsMime(mime: string): boolean {
+  return /mpegurl/i.test(mime);
+}
+
 /** Best-effort MIME from an explicit value or a filename/URL extension. */
 export function guessMime(nameOrUrl: string, explicit?: string | null): string {
   if (explicit && explicit !== 'application/octet-stream') return explicit;
@@ -65,11 +80,15 @@ export function mediaFromUrl(url: string): MediaItem {
   const trimmed = url.trim();
   const name = decodeURIComponent(trimmed.split(/[?#]/)[0].split('/').pop() || 'Stream');
   const mime = guessMime(trimmed);
+  // HLS is detected by the .m3u8 extension OR the playlist token appearing
+  // anywhere in the URL (many stream links carry no extension at all).
+  const live = isHlsMime(mime) || /\bm3u8\b/i.test(trimmed);
   return {
     uri: trimmed,
     name,
-    mime,
+    mime: live ? HLS_MIME : mime,
     kind: kindFromMime(mime),
     isLocal: false,
+    live,
   };
 }

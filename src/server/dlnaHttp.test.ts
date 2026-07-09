@@ -4,6 +4,8 @@ import {
   npt,
   nptToSeconds,
   parseHttpHead,
+  pickReadySegment,
+  planLiveResponse,
   planResponse,
   type ServedFile,
 } from "./dlnaHttp";
@@ -123,5 +125,59 @@ describe("planResponse", () => {
     );
     expect(p.status).toBe("200 OK");
     expect(p.headers["TimeSeekRange.dlna.org"]).toBeUndefined();
+  });
+});
+
+const LIVE = {
+  mime: "video/mp2t",
+  features: "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=8d500000000000000000000000000000",
+};
+
+describe("planLiveResponse", () => {
+  test("404 when there is no live source or wrong method", () => {
+    expect(planLiveResponse({ method: "GET", path: "/live.ts", headers: {} }, null, DATE).status).toBe(
+      "404 Not Found",
+    );
+    expect(planLiveResponse({ method: "POST", path: "/live.ts", headers: {} }, LIVE, DATE).status).toBe(
+      "404 Not Found",
+    );
+  });
+
+  test("GET streams with no Content-Length / Accept-Ranges and the live features", () => {
+    const p = planLiveResponse({ method: "GET", path: "/live.ts", headers: {} }, LIVE, DATE);
+    expect(p.status).toBe("200 OK");
+    expect(p.hasBody).toBe(true);
+    expect(p.headers["Content-Type"]).toBe("video/mp2t");
+    expect(p.headers["contentFeatures.dlna.org"]).toBe(LIVE.features);
+    expect(p.headers["transferMode.dlna.org"]).toBe("Streaming");
+    expect(p.headers["Content-Length"]).toBeUndefined();
+    expect(p.headers["Accept-Ranges"]).toBeUndefined();
+  });
+
+  test("HEAD returns headers but no body", () => {
+    const p = planLiveResponse({ method: "HEAD", path: "/live.ts", headers: {} }, LIVE, DATE);
+    expect(p.status).toBe("200 OK");
+    expect(p.hasBody).toBe(false);
+  });
+});
+
+describe("pickReadySegment", () => {
+  const names = ["seg000000.ts", "seg000001.ts", "seg000002.ts"];
+
+  test("while running, holds back the highest (in-progress) segment", () => {
+    // seg2 is being written, so the newest complete one is seg1.
+    expect(pickReadySegment(names, -1, true)).toEqual({ name: "seg000000.ts", index: 0 });
+    expect(pickReadySegment(names, 0, true)).toEqual({ name: "seg000001.ts", index: 1 });
+    // Only the in-progress segment is newer than what we've served → nothing ready.
+    expect(pickReadySegment(names, 1, true)).toBeNull();
+  });
+
+  test("once stopped, the final segment is also served", () => {
+    expect(pickReadySegment(names, 1, false)).toEqual({ name: "seg000002.ts", index: 2 });
+  });
+
+  test("ignores non-segment files and returns null when nothing is newer", () => {
+    expect(pickReadySegment(["index.html", "seg000005.ts"], 5, false)).toBeNull();
+    expect(pickReadySegment([], -1, true)).toBeNull();
   });
 });

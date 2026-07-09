@@ -19,6 +19,7 @@ import android.support.v4.media.MediaMetadataCompat
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import androidx.core.app.NotificationCompat
+import androidx.media.VolumeProviderCompat
 
 /**
  * Foreground service that keeps the process + radios awake while casting AND
@@ -33,6 +34,9 @@ class CastKeepAliveService : Service() {
   private var wakeLock: PowerManager.WakeLock? = null
   private var wifiLock: WifiManager.WifiLock? = null
   private var session: MediaSessionCompat? = null
+  // Routes the phone's hardware volume keys to the TV instead of the phone's own
+  // audio stream (see ensureSession). Its currentVolume mirrors the TV's level.
+  private var volumeProvider: VolumeProviderCompat? = null
 
   // Latest playback info, so a bare command intent (no extras) can rebuild the
   // notification without losing the title/duration/etc.
@@ -43,6 +47,7 @@ class CastKeepAliveService : Service() {
   private var lastControls = true
   private var lastArtPath = ""
   private var lastArt: Bitmap? = null
+  private var lastVolume = -1 // 0–100, or -1 when the TV's volume is unknown
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -62,6 +67,7 @@ class CastKeepAliveService : Service() {
           lastPosition = intent.getDoubleExtra(EXTRA_POSITION, lastPosition)
           lastDuration = intent.getDoubleExtra(EXTRA_DURATION, lastDuration)
           lastControls = intent.getBooleanExtra(EXTRA_CONTROLS, lastControls)
+          lastVolume = intent.getIntExtra(EXTRA_VOLUME, lastVolume)
           loadArtwork(intent.getStringExtra(EXTRA_ARTWORK) ?: "")
         }
       }
@@ -112,6 +118,7 @@ class CastKeepAliveService : Service() {
     releaseLocks()
     session?.release()
     session = null
+    volumeProvider = null
     super.onDestroy()
   }
 
@@ -119,21 +126,54 @@ class CastKeepAliveService : Service() {
 
   private fun ensureSession() {
     if (session != null) return
-    session = MediaSessionCompat(this, "CastAnything").apply {
-      setCallback(object : MediaSessionCompat.Callback() {
-        override fun onPlay() = CastKeepAliveModule.dispatch("play", null)
-        override fun onPause() = CastKeepAliveModule.dispatch("pause", null)
-        override fun onStop() = CastKeepAliveModule.dispatch("stop", null)
-        override fun onFastForward() = CastKeepAliveModule.dispatch("seekBy", SKIP_SECONDS)
-        override fun onRewind() = CastKeepAliveModule.dispatch("seekBy", -SKIP_SECONDS)
-        override fun onSeekTo(pos: Long) = CastKeepAliveModule.dispatch("seekTo", pos / 1000.0)
-      })
-      isActive = true
+    val s = MediaSessionCompat(this, "CastAnything")
+    s.setCallback(object : MediaSessionCompat.Callback() {
+      override fun onPlay() = CastKeepAliveModule.dispatch("play", null)
+      override fun onPause() = CastKeepAliveModule.dispatch("pause", null)
+      override fun onStop() = CastKeepAliveModule.dispatch("stop", null)
+      override fun onFastForward() = CastKeepAliveModule.dispatch("seekBy", SKIP_SECONDS)
+      override fun onRewind() = CastKeepAliveModule.dispatch("seekBy", -SKIP_SECONDS)
+      override fun onSeekTo(pos: Long) = CastKeepAliveModule.dispatch("seekTo", pos / 1000.0)
+    })
+    s.isActive = true
+
+    // Declare playback as *remote*: while this session is the active media
+    // session, Android routes the phone's hardware volume keys (and the system
+    // volume slider) to this provider instead of the phone's own audio stream,
+    // so the user controls the TV's volume with their phone. We report the
+    // resulting absolute target to JS, which pushes it to the TV over DLNA.
+    val provider = object : VolumeProviderCompat(
+      VOLUME_CONTROL_ABSOLUTE,
+      VOLUME_MAX,
+      if (lastVolume in 0..VOLUME_MAX) lastVolume else VOLUME_DEFAULT,
+    ) {
+      override fun onAdjustVolume(direction: Int) {
+        if (direction == 0) return // key released — nothing to change
+        val next = (currentVolume + direction * VOLUME_STEP).coerceIn(0, VOLUME_MAX)
+        currentVolume = next
+        CastKeepAliveModule.dispatch("volumeTo", next.toDouble())
+      }
+
+      override fun onSetVolumeTo(volume: Int) {
+        val next = volume.coerceIn(0, VOLUME_MAX)
+        currentVolume = next
+        CastKeepAliveModule.dispatch("volumeTo", next.toDouble())
+      }
     }
+    volumeProvider = provider
+    s.setPlaybackToRemote(provider)
+
+    session = s
   }
 
   private fun updateSession() {
     val s = session ?: return
+    // Keep the phone's volume UI in step with the TV (it may have changed via the
+    // on-screen buttons or the TV's own remote). Skip while unknown (-1).
+    val vp = volumeProvider
+    if (vp != null && lastVolume in 0..VOLUME_MAX && vp.currentVolume != lastVolume) {
+      vp.currentVolume = lastVolume
+    }
     val canSeek = lastControls && lastDuration > 0
     val durationMs = if (lastDuration > 0) (lastDuration * 1000).toLong() else -1L
 
@@ -270,6 +310,7 @@ class CastKeepAliveService : Service() {
     const val EXTRA_DURATION = "duration"
     const val EXTRA_CONTROLS = "controls"
     const val EXTRA_ARTWORK = "artwork"
+    const val EXTRA_VOLUME = "volume"
 
     const val STATE_PLAYING = "playing"
     const val STATE_PAUSED = "paused"
@@ -285,5 +326,12 @@ class CastKeepAliveService : Service() {
     private const val SKIP_SECONDS = 15.0
     private const val CHANNEL_ID = "cast_anything_playback"
     private const val NOTIFICATION_ID = 7311
+
+    // Remote-volume scale: 0–100 to match DLNA RenderingControl. Each hardware
+    // key press nudges by VOLUME_STEP; VOLUME_DEFAULT seeds the slider before the
+    // TV's real level is known.
+    private const val VOLUME_MAX = 100
+    private const val VOLUME_STEP = 1
+    private const val VOLUME_DEFAULT = 50
   }
 }

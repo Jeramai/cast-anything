@@ -47,3 +47,6 @@ modules/**/.gradle/
 
 # personal Claude Code settings (shared settings.json stays tracked)
 .claude/settings.local.json
+
+# Release signing key + passwords (Play Store upload). NEVER commit.
+/credentials/

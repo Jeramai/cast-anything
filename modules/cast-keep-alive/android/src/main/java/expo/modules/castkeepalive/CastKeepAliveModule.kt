@@ -28,7 +28,7 @@ class CastKeepAliveModule : Module() {
     OnCreate { instance = this@CastKeepAliveModule }
     OnDestroy { if (instance === this@CastKeepAliveModule) instance = null }
 
-    Function("present") { title: String, state: String, position: Double, duration: Double, controls: Boolean, artworkPath: String ->
+    Function("present") { title: String, state: String, position: Double, duration: Double, controls: Boolean, artworkPath: String, volume: Double ->
       val context = appContext.reactContext
       if (context != null) {
         val intent = Intent(context, CastKeepAliveService::class.java).apply {
@@ -39,6 +39,7 @@ class CastKeepAliveModule : Module() {
           putExtra(CastKeepAliveService.EXTRA_DURATION, duration)
           putExtra(CastKeepAliveService.EXTRA_CONTROLS, controls)
           putExtra(CastKeepAliveService.EXTRA_ARTWORK, artworkPath)
+          putExtra(CastKeepAliveService.EXTRA_VOLUME, volume.toInt())
         }
         // First call (while the app is foreground) promotes to a foreground
         // service; later updates just deliver onStartCommand to the running one.

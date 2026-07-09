@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 import { describe, expect, test } from "bun:test";
-import { extensionOf, guessMime, kindFromMime, mediaFromUrl } from "./mime";
+import { extensionOf, guessMime, isHlsMime, kindFromMime, mediaFromUrl, HLS_MIME } from "./mime";
 
 describe("extensionOf", () => {
   test("lowercases and strips query/hash", () => {
@@ -51,5 +51,28 @@ describe("mediaFromUrl", () => {
   });
   test("falls back to 'Stream' when there's no filename", () => {
     expect(mediaFromUrl("http://h/").name).toBe("Stream");
+  });
+  test("flags an .m3u8 URL as a live HLS stream", () => {
+    const m = mediaFromUrl("https://cdn.example.com/game/index.m3u8?token=abc");
+    expect(m.mime).toBe(HLS_MIME);
+    expect(m.kind).toBe("video");
+    expect(m.live).toBe(true);
+    expect(m.isLocal).toBe(false);
+  });
+  test("detects HLS even without a clean .m3u8 extension", () => {
+    expect(mediaFromUrl("https://h/live/playlist.m3u8/chunklist").live).toBe(true);
+  });
+  test("a regular mp4 URL is not live", () => {
+    expect(mediaFromUrl("https://h/clip.mp4").live).toBe(false);
+  });
+});
+
+describe("isHlsMime", () => {
+  test("true for the apple mpegurl mimes", () => {
+    expect(isHlsMime("application/vnd.apple.mpegurl")).toBe(true);
+    expect(isHlsMime("application/x-mpegURL")).toBe(true);
+  });
+  test("false for plain video mimes", () => {
+    expect(isHlsMime("video/mp4")).toBe(false);
   });
 });

@@ -21,6 +21,7 @@ export function presentPlayback(info: PlaybackInfo): void {
       info.duration,
       info.controls,
       info.artworkPath ?? '',
+      info.volume ?? -1,
     );
   } catch {
     /* native module absent or threw */

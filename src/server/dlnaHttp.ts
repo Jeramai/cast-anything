@@ -126,3 +126,72 @@ export function planResponse(req: HttpRequest, file: ServedFile | null, date: st
     hasBody: req.method === 'GET',
   };
 }
+
+export interface LiveResponsePlan {
+  status: string;
+  headers: Record<string, string>;
+  /** True only for a GET against an active live source (not HEAD / 404). */
+  hasBody: boolean;
+}
+
+/**
+ * Decide the response for a *live* stream request (our on-device HLS→MPEG-TS
+ * remux). Unlike a file, a live feed has no known size and isn't seekable, so we
+ * send neither `Content-Length` nor `Accept-Ranges` and just stream bytes until
+ * the source ends or the renderer disconnects. The DLNA live flags must already
+ * be baked into `live.features` (see contentFeatures(kind, true)).
+ */
+export function planLiveResponse(
+  req: HttpRequest,
+  live: { mime: string; features: string } | null,
+  date: string,
+): LiveResponsePlan {
+  const isGetOrHead = req.method === 'GET' || req.method === 'HEAD';
+  if (!live || !isGetOrHead) {
+    return {
+      status: '404 Not Found',
+      headers: { 'Content-Length': '0', Connection: 'close' },
+      hasBody: false,
+    };
+  }
+  return {
+    status: '200 OK',
+    headers: {
+      'Content-Type': live.mime,
+      Date: date,
+      'transferMode.dlna.org': 'Streaming',
+      'contentFeatures.dlna.org': live.features,
+      Server: 'CastAnything/1.0',
+      Connection: 'close',
+    },
+    hasBody: req.method === 'GET',
+  };
+}
+
+/**
+ * Pure segment-picker for the rolling live buffer: given the segment filenames
+ * currently on disk (e.g. `seg000007.ts`), the highest index already handed out,
+ * and whether FFmpeg is still producing, return the next *complete* segment to
+ * stream — or null if none is ready yet.
+ *
+ * A segment is complete once a higher-indexed one exists (the muxer has moved on
+ * to it). The single highest index is therefore the in-progress one and is held
+ * back — UNLESS FFmpeg has stopped, in which case the last segment is final too.
+ */
+export function pickReadySegment(
+  names: string[],
+  lastIndex: number,
+  running: boolean,
+): { name: string; index: number } | null {
+  const segs = names
+    .map((name) => {
+      const m = /seg(\d+)\.ts$/.exec(name);
+      return m ? { name, index: parseInt(m[1], 10) } : null;
+    })
+    .filter((s): s is { name: string; index: number } => s != null && s.index > lastIndex)
+    .sort((a, b) => a.index - b.index);
+  if (segs.length === 0) return null;
+  const maxIndex = segs[segs.length - 1].index;
+  const ready = running ? segs.filter((s) => s.index < maxIndex) : segs;
+  return ready.length ? ready[0] : null;
+}

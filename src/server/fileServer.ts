@@ -17,7 +17,16 @@ import { getWsPort } from '../ws/wsServer';
 import { sanitizeFileName } from './sanitize';
 import { contentFeatures } from '../dlna/avtransport';
 import type { MediaKind } from '../dlna/types';
-import { startMediaServer, setServedFile, setSubtitleFile, MEDIA_PORT, SUBTITLE_PATH } from './mediaServer';
+import {
+  startMediaServer,
+  setServedFile,
+  setSubtitleFile,
+  setLiveSource,
+  MEDIA_PORT,
+  SUBTITLE_PATH,
+  LIVE_PATH,
+} from './mediaServer';
+import { startLiveRemux, stopLiveRemux } from '../convert/liveStream';
 
 /**
  * Serves locally-picked media over HTTP so a TV on the same Wi-Fi can stream it.
@@ -385,6 +394,24 @@ export async function shareLocalFile(
     features: contentFeatures(opts.kind),
   });
   return url;
+}
+
+/**
+ * Begin remuxing a live HLS URL on-device and serve it as a continuous MPEG-TS
+ * feed from our DLNA media server; returns the URL the TV should stream from.
+ * (Android only — guarded by ffmpegAvailable in the caller.)
+ */
+export async function serveLiveStream(srcUrl: string): Promise<string> {
+  await startMediaServer();
+  const ip = await getLanIp();
+  setLiveSource(await startLiveRemux(srcUrl));
+  return `http://${ip}:${MEDIA_PORT}${LIVE_PATH}`;
+}
+
+/** Stop any live remux and detach it from the media server. Idempotent. */
+export async function stopLiveStream(): Promise<void> {
+  setLiveSource(null);
+  await stopLiveRemux();
 }
 
 const SUBS_DIR = `${CachesDirectoryPath}/cast-subs`;

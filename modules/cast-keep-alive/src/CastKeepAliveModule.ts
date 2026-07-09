@@ -21,6 +21,7 @@ declare class CastKeepAliveModule extends NativeModule<CastKeepAliveEvents> {
     duration: number,
     controls: boolean,
     artworkPath: string,
+    volume: number,
   ): void;
   /** Tear down the foreground service / end the background task. */
   stop(): void;

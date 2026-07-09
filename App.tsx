@@ -498,7 +498,7 @@ function CastScreen() {
             <TextInput
               value={urlInput}
               onChangeText={setUrlInput}
-              placeholder="…or paste a media URL"
+              placeholder="…or paste a media URL or .m3u8 stream"
               placeholderTextColor={C.textDim}
               autoCapitalize="none"
               autoCorrect={false}
