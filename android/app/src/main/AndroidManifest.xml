@@ -1,0 +1,231 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" xmlns:tools="http://schemas.android.com/tools">
+  <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE"/>
+  <uses-permission android:name="android.permission.ACCESS_WIFI_STATE"/>
+  <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE"/>
+  <uses-permission android:name="android.permission.INTERNET"/>
+  <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" tools:replace="android:maxSdkVersion"/>
+  <uses-permission android:name="android.permission.READ_MEDIA_AUDIO"/>
+  <uses-permission android:name="android.permission.READ_MEDIA_IMAGES"/>
+  <uses-permission android:name="android.permission.READ_MEDIA_VIDEO"/>
+  <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED"/>
+  <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW"/>
+  <uses-permission android:name="android.permission.VIBRATE"/>
+  <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="32" tools:replace="android:maxSdkVersion"/>
+  <queries>
+    <intent>
+      <action android:name="android.intent.action.VIEW"/>
+      <category android:name="android.intent.category.BROWSABLE"/>
+      <data android:scheme="https"/>
+    </intent>
+  </queries>
+  <application android:name=".MainApplication" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:allowBackup="true" android:theme="@style/AppTheme" android:supportsRtl="true" android:enableOnBackInvokedCallback="false" android:requestLegacyExternalStorage="true" android:usesCleartextTraffic="true">
+    <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
+    <meta-data android:name="expo.modules.updates.ENABLE_BSDIFF_PATCH_SUPPORT" android:value="true"/>
+    <meta-data android:name="expo.modules.updates.EXPO_UPDATES_CHECK_ON_LAUNCH" android:value="ALWAYS"/>
+    <meta-data android:name="expo.modules.updates.EXPO_UPDATES_LAUNCH_WAIT_MS" android:value="0"/>
+    <activity android:name=".MainActivity" android:configChanges="keyboard|keyboardHidden|orientation|screenSize|screenLayout|uiMode|smallestScreenSize" android:launchMode="singleTask" android:windowSoftInputMode="adjustResize" android:theme="@style/Theme.App.SplashScreen" android:exported="true" android:screenOrientation="portrait">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityblue" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_blue" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_blue">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityindigo" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_indigo" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_indigo">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityviolet" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_violet" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_violet">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityfuchsia" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_fuchsia" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_fuchsia">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivitypink" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_pink" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_pink">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityrose" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_rose" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_rose">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityred" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_red" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_red">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityfirebrick" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_firebrick" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_firebrick">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityorange" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_orange" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_orange">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityamber" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_amber" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_amber">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivitylime" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_lime" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_lime">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityemerald" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_emerald" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_emerald">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityteal" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_teal" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_teal">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivitycyan" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_cyan" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_cyan">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivitysky" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_sky" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_sky">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+    <activity-alias android:name="ai.jeram.castanything.MainActivityslate" android:enabled="false" android:exported="true" android:icon="@mipmap/ic_launcher_adaptive_slate" android:label="@string/app_name" android:targetActivity=".MainActivity" android:roundIcon="@mipmap/ic_launcher_adaptive_slate">
+      <intent-filter>
+        <action android:name="android.intent.action.MAIN"/>
+        <category android:name="android.intent.category.LAUNCHER"/>
+      </intent-filter>
+      <intent-filter>
+        <action android:name="android.intent.action.VIEW"/>
+        <category android:name="android.intent.category.DEFAULT"/>
+        <category android:name="android.intent.category.BROWSABLE"/>
+        <data android:scheme="castanything"/>
+      </intent-filter>
+    </activity-alias>
+  </application>
+</manifest>
