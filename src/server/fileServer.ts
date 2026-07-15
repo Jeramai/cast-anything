@@ -344,11 +344,19 @@ async function materialize(
     }
   }
   const fromPath = localUri.replace(/^file:\/\//, '');
-  try {
-    await moveFile(fromPath, destPath); // instant rename when on the same volume
-  } catch {
-    await copyWithProgress(fromPath, destPath, knownSize || (await fileSize(fromPath)), onProgress);
+  // moveFile() DELETES the source, so only use it for a throwaway import temp
+  // (iOS picker copies land in tmp/Caches). For anything that might be a real user
+  // file, copy — never relocate the original out from under them.
+  const isImportTemp = /\/(tmp|caches?|documentpicker|inbox)\b/i.test(fromPath);
+  if (isImportTemp) {
+    try {
+      await moveFile(fromPath, destPath); // instant rename when on the same volume
+      return;
+    } catch {
+      /* fall through to a safe copy */
+    }
   }
+  await copyWithProgress(fromPath, destPath, knownSize || (await fileSize(fromPath)), onProgress);
 }
 
 /**
@@ -372,11 +380,22 @@ export async function shareLocalFile(
   // lighttpd for its player page via writePlayerPage — DLNA doesn't need it, so we
   // don't couple casting to lighttpd here.)
   await startMediaServer();
+  // The share dir must exist before we copy into it. On a fresh install (or after
+  // Android evicts the cache dir under storage pressure) it doesn't yet, and
+  // clearShareDir() only *reads* it — so without this, the very first cast fails
+  // with ENOENT ("No such file or directory"), surfacing to the user as a cryptic
+  // "file not found". ensureShareDir is idempotent.
+  await ensureShareDir();
   const ip = await getLanIp();
 
   const safeName = sanitizeFileName(displayName);
   const destPath = `${SHARE_DIR}/${safeName}`;
-  const url = `http://${ip}:${MEDIA_PORT}/${encodeURIComponent(safeName)}`;
+  // Short, clean URL path — not the full (often torrent-style) filename. Only one
+  // item ever streams at a time, so a constant `/cast` is fine; we keep the file
+  // extension because some Samsung renderers sniff it. e.g. http://ip:51797/cast.mp4
+  const dot = safeName.lastIndexOf('.');
+  const ext = dot > 0 ? safeName.slice(dot).toLowerCase() : '';
+  const url = `http://${ip}:${MEDIA_PORT}/cast${ext}`;
 
   // Re-casting the same item: the file is already materialized — skip the copy.
   if (!(lastShared?.localUri === localUri && (await exists(destPath)))) {

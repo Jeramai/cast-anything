@@ -1,0 +1,3 @@
+for_platform :android do
+  package_name(ENV["CASTANYTHING_ANDROID_PACKAGE"] || "ai.jeram.castanything")
+end

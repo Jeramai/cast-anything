@@ -29,7 +29,6 @@ const STARTUP_TIMEOUT_MS = 20_000;
 
 let sessionId: number | null = null;
 let running = false;
-let lastIndex = -1;
 
 const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -58,31 +57,6 @@ export async function stopLiveRemux(): Promise<void> {
   await clearLiveDir();
 }
 
-/** Block until the next complete segment is ready, or null once the feed ends. */
-async function nextSegment(alive: () => boolean): Promise<string | null> {
-  let waited = 0;
-  while (alive()) {
-    let names: string[] = [];
-    try {
-      names = (await readDir(LIVE_DIR)).map((e) => e.name);
-    } catch {
-      /* transient */
-    }
-    const pick = pickReadySegment(names, lastIndex, running);
-    if (pick) {
-      lastIndex = pick.index;
-      return `${LIVE_DIR}/${pick.name}`;
-    }
-    // FFmpeg has exited and nothing complete remains → the stream is over.
-    if (!running && pickReadySegment(names, lastIndex, false) == null) return null;
-    // Bail if startup never yields a first segment, so the cast can error out.
-    if (lastIndex < 0 && waited >= STARTUP_TIMEOUT_MS) return null;
-    await delay(POLL_MS);
-    waited += POLL_MS;
-  }
-  return null;
-}
-
 /**
  * Start remuxing `srcUrl` (an HLS playlist) into rolling MPEG-TS segments and
  * return a {@link LiveSource} the media server can stream. Throws if FFmpeg isn't
@@ -94,8 +68,35 @@ export async function startLiveRemux(srcUrl: string): Promise<LiveSource> {
   }
   await stopLiveRemux();
   if (!(await exists(LIVE_DIR))) await mkdir(LIVE_DIR);
-  lastIndex = -1;
   running = true;
+  // Per-session segment cursor (was a module global that bled across streams and
+  // reconnects — a fresh remux must always start from the beginning of its own dir).
+  let lastIndex = -1;
+
+  /** Block until the next complete segment is ready, or null once the feed ends. */
+  const next = async (alive: () => boolean): Promise<string | null> => {
+    let waited = 0;
+    while (alive()) {
+      let names: string[] = [];
+      try {
+        names = (await readDir(LIVE_DIR)).map((e) => e.name);
+      } catch {
+        /* transient */
+      }
+      const pick = pickReadySegment(names, lastIndex, running);
+      if (pick) {
+        lastIndex = pick.index;
+        return `${LIVE_DIR}/${pick.name}`;
+      }
+      // FFmpeg has exited and nothing complete remains → the stream is over.
+      if (!running && pickReadySegment(names, lastIndex, false) == null) return null;
+      // Bail if startup never yields a first segment, so the cast can error out.
+      if (lastIndex < 0 && waited >= STARTUP_TIMEOUT_MS) return null;
+      await delay(POLL_MS);
+      waited += POLL_MS;
+    }
+    return null;
+  };
 
   const args = [
     '-hide_banner',
@@ -143,7 +144,7 @@ export async function startLiveRemux(srcUrl: string): Promise<LiveSource> {
   return {
     mime: 'video/mp2t',
     features: contentFeatures('video', true),
-    next: nextSegment,
+    next,
     done: (path: string) => {
       unlink(path).catch(() => {});
     },

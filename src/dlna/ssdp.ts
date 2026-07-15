@@ -51,14 +51,18 @@ export function discoverSsdp(opts: {
   const socket = UdpSockets.createSocket({ type: 'udp4' }) as unknown as UdpSocketLike;
   const seen = new Set<string>();
   let closed = false;
+  // Once the socket is bound, errors are non-fatal (a failed multicast send on one
+  // interface, setBroadcast being unsupported, or the socket closing at timeout).
+  // Only a *pre-listening* error means the socket is unusable.
+  let listening = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let resendTimer: ReturnType<typeof setTimeout> | undefined;
+  let resendTimer: ReturnType<typeof setInterval> | undefined;
 
   const stop = () => {
     if (closed) return;
     closed = true;
     if (timer) clearTimeout(timer);
-    if (resendTimer) clearTimeout(resendTimer);
+    if (resendTimer) clearInterval(resendTimer);
     try {
       socket.close();
     } catch {
@@ -67,8 +71,16 @@ export function discoverSsdp(opts: {
   };
 
   socket.on('error', (err: Error) => {
-    onError?.(err);
-    stop();
+    if (!listening) {
+      // Bind failed / socket unusable → surface it and give up.
+      onError?.(err);
+      stop();
+    } else {
+      // Benign post-bind error. Do NOT abort discovery or surface a toast: a send
+      // failure on one interface, or the socket closing at timeout, must not hide
+      // the devices that DID answer — nor show a scary error when none did.
+      console.warn('[ssdp] socket error (ignored, discovery continues):', err);
+    }
   });
 
   socket.on('message', (msg: Buffer | Uint8Array, rinfo: { address: string }) => {
@@ -101,14 +113,19 @@ export function discoverSsdp(opts: {
   };
 
   socket.once('listening', () => {
+    listening = true;
     try {
+      // Not required for multicast SSDP; best-effort and its async failure is now
+      // non-fatal (see the 'error' handler above).
       socket.setBroadcast(true);
     } catch {
       /* not all platforms require/allow this */
     }
     sendAll();
-    // Devices answer within MX seconds; re-probe once to catch slow responders.
-    resendTimer = setTimeout(sendAll, 1500);
+    // Multicast is unreliable and slow devices answer late, so re-probe repeatedly
+    // across the window rather than once — this markedly reduces "found nothing on
+    // the first scan" flakiness. Cleared by stop() at timeoutMs.
+    resendTimer = setInterval(sendAll, 1200);
   });
 
   // Bind to a random port on all interfaces; replies arrive as unicast here.

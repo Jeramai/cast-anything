@@ -50,3 +50,8 @@ modules/**/.gradle/
 
 # Release signing key + passwords (Play Store upload). NEVER commit.
 /credentials/
+
+# Built store artifacts (produced by scripts/build-android-store.sh)
+/app-release.aab
+*.aab
+*.apk

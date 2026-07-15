@@ -14,6 +14,7 @@ import {
   KeyboardAvoidingView,
   Modal,
   PanResponder,
+  PermissionsAndroid,
   Platform,
   Pressable,
   ScrollView,
@@ -27,6 +28,7 @@ import {
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import * as SystemUI from "expo-system-ui";
+import * as Clipboard from "expo-clipboard";
 import type { DlnaDevice } from "./src/dlna";
 import { useCast } from "./src/hooks/useCast";
 import type { OutputMode } from "./src/convert/gallery";
@@ -385,6 +387,9 @@ function CastScreen() {
   const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [convertOpen, setConvertOpen] = useState(false);
+  // True when the convert dialog was opened via the "1080p" button (force a ≤1080p
+  // H.264 re-encode) rather than the plain "Convert" (minimal make-castable) button.
+  const [convert1080p, setConvert1080p] = useState(false);
   const [subsOpen, setSubsOpen] = useState(false);
   const [subLang, setSubLang] = useState("en");
   // Where a conversion's output goes: cache only, or also saved to the gallery.
@@ -443,7 +448,9 @@ function CastScreen() {
           />
           {cast.devices.length === 0 && !cast.isScanning && (
             <Text style={styles.hint}>
-              Make sure the TV is on and on the same Wi-Fi, then scan.
+              {cast.scanCompleted
+                ? "No devices found. Make sure the TV is on, awake, and on the same Wi-Fi as this phone — then scan again."
+                : "Make sure the TV is on and on the same Wi-Fi, then scan."}
             </Text>
           )}
           <View style={{ gap: 8, marginTop: cast.devices.length ? 12 : 0 }}>
@@ -468,25 +475,43 @@ function CastScreen() {
               onPress={cast.chooseFile}
               style={{ flex: 1 }}
             />
-            {/* Convert an unsupported local file (e.g. .mkv/.avi) → MP4. Always shown
-                (when this build has FFmpeg) but disabled until a local file is picked.
-                Opens a dialog that holds the options + progress. */}
+          </View>
+          {/* Secondary actions on their own row so they each have room. Convert makes
+              an unsupported local file TV-friendly (fast remux when possible); 1080p
+              forces a ≤1080p H.264 re-encode for HEVC/4K files the TV can't play; Subs
+              attaches an .srt. All need FFmpeg (Convert/1080p) or a video (Subs). */}
+          <View style={[styles.pickRow, { marginTop: 8 }]}>
             {cast.canConvert && (
               <Button
                 icon="sync"
                 title="Convert"
                 disabled={!(cast.media?.isLocal && cast.media.kind !== "image")}
-                onPress={() => setConvertOpen(true)}
+                onPress={() => {
+                  setConvert1080p(false);
+                  setConvertOpen(true);
+                }}
+                style={{ flex: 1 }}
               />
             )}
-            {/* Subtitles — fetch an .srt from OpenSubtitles and attach it. Shown for
-                any video (local or URL); the chip below shows when one is attached. */}
+            {cast.canConvert && (
+              <Button
+                icon="tv"
+                title="1080p"
+                disabled={!(cast.media?.isLocal && cast.media.kind === "video")}
+                onPress={() => {
+                  setConvert1080p(true);
+                  setConvertOpen(true);
+                }}
+                style={{ flex: 1 }}
+              />
+            )}
             <Button
               icon="chatbox-ellipses"
               title={cast.subtitle ? cast.subtitle.language.toUpperCase() : "Subs"}
               variant={cast.subtitle ? "primary" : "secondary"}
               disabled={cast.media?.kind !== "video"}
               onPress={() => setSubsOpen(true)}
+              style={{ flex: 1 }}
             />
           </View>
           {cast.importing && (
@@ -540,17 +565,65 @@ function CastScreen() {
 
         {/* ---- Cast ---- */}
         {/* While a big local file copies into the server dir, the button itself
-            fills as a progress bar (cast.castProgress); otherwise it spins. */}
-        <Button
-          icon="play-circle"
-          title={cast.selectedDevice?.isSignage ? "Send to signage" : "Cast to device"}
-          variant="primary"
-          loading={cast.busy}
-          progress={cast.castProgress}
-          disabled={!cast.selectedDevice || !cast.media}
-          onPress={cast.cast}
-          style={{ marginTop: 4 }}
-        />
+            fills as a progress bar (cast.castProgress); otherwise it spins.
+            Hidden once the "can't cast — stream it instead" fallback is up: for
+            this file + TV a normal cast would just fail again, and leaving it
+            would spin in lock-step with the Stream-via-URL button. Picking a
+            different file/device or converting brings it back. */}
+        {!(cast.canStreamViaUrl || cast.streamUrl) && (
+          <Button
+            icon="play-circle"
+            title={cast.selectedDevice?.isSignage ? "Send to signage" : "Cast to device"}
+            variant="primary"
+            loading={cast.busy}
+            progress={cast.castProgress}
+            disabled={!cast.selectedDevice || !cast.media}
+            onPress={cast.cast}
+            style={{ marginTop: 4 }}
+          />
+        )}
+
+        {/* ---- Stream-via-URL fallback (a file the TV can't DLNA-cast) ---- */}
+        {(cast.canStreamViaUrl || cast.streamUrl) && (
+          <Section title="Stream via URL">
+            {cast.streamUrl ? (
+              <>
+                <Text style={styles.hint}>
+                  Serving from your phone. This TV can’t play the file itself — open
+                  this URL in a player like VLC on a computer or another device on
+                  this Wi-Fi:
+                </Text>
+                <Text selectable style={styles.urlBox}>
+                  {cast.streamUrl}
+                </Text>
+                <Button
+                  icon="copy-outline"
+                  title="Copy URL"
+                  onPress={() => {
+                    if (cast.streamUrl) Clipboard.setStringAsync(cast.streamUrl);
+                  }}
+                  style={{ marginTop: 8 }}
+                />
+              </>
+            ) : (
+              <>
+                <Text style={styles.hint}>
+                  Your TV can’t cast this file, but the phone can serve it so you can
+                  play it in a browser or media-player app elsewhere.
+                </Text>
+                <Button
+                  icon="link-outline"
+                  title="Stream via URL instead"
+                  loading={cast.busy}
+                  progress={cast.castProgress}
+                  progressLabel="Serving"
+                  onPress={cast.streamViaUrl}
+                  style={{ marginTop: 8 }}
+                />
+              </>
+            )}
+          </Section>
+        )}
 
         {/* ---- Signage (URL Launcher) result ---- */}
         {cast.signage && (
@@ -762,7 +835,9 @@ function CastScreen() {
         >
           <Pressable style={styles.modalCard} onPress={() => {}}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>Convert for TV</Text>
+              <Text style={styles.modalTitle}>
+                {convert1080p ? "Convert to 1080p" : "Convert for TV"}
+              </Text>
               <Pressable
                 onPress={() => setConvertOpen(false)}
                 hitSlop={10}
@@ -775,6 +850,12 @@ function CastScreen() {
             {cast.media && (
               <Text style={styles.hint} numberOfLines={2}>
                 {cast.media.name}
+              </Text>
+            )}
+            {convert1080p && (
+              <Text style={styles.hint}>
+                Re-encodes to 1080p H.264 (downscaling 4K). Makes HEVC / 4K files your
+                TV can’t play castable — slower than a plain Convert.
               </Text>
             )}
 
@@ -823,7 +904,7 @@ function CastScreen() {
                 title="Convert"
                 variant="primary"
                 onPress={async () => {
-                  await cast.convertSelected(outMode);
+                  await cast.convertSelected(outMode, convert1080p);
                   setConvertOpen(false);
                 }}
                 style={{ marginTop: 14 }}
@@ -949,6 +1030,18 @@ export default function App() {
     return () => {
       setScreenAwake(false);
     };
+  }, []);
+
+  // Android 13+ suppresses the foreground-service playback notification (and with
+  // it the lock-screen / hardware-key transport controls) unless POST_NOTIFICATIONS
+  // is granted at runtime. Ask once on startup; harmless/no-op on older Android + iOS.
+  useEffect(() => {
+    if (Platform.OS !== "android" || Platform.Version < 33) return;
+    const perm = PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS;
+    if (!perm) return;
+    PermissionsAndroid.check(perm).then((granted) => {
+      if (!granted) PermissionsAndroid.request(perm).catch(() => {});
+    }).catch(() => {});
   }, []);
 
   // Load the saved choice once on startup.

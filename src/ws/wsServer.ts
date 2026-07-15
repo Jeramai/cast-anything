@@ -107,19 +107,27 @@ export function startWsServer(handlers: {
   startPromise = new Promise<number>((resolve, reject) => {
     let settled = false;
     try {
-      server = TcpSocket.createServer((socket: any) => handleConnection(socket));
-      server.on('error', (e: Error) => {
+      const s = TcpSocket.createServer((socket: any) => handleConnection(socket));
+      s.on('error', (e: Error) => {
         // Usually the port is held by a server orphaned across a JS reload.
         console.warn('[ws] server error:', e?.message);
         if (!settled) {
           settled = true;
-          server = null; // don't leave a dead handle; allow a later retry
+          if (server === s) server = null; // don't leave a dead handle; allow a later retry
           reject(e instanceof Error ? e : new Error(String(e)));
+        } else if (server === s) {
+          // Died after startup — drop the dead handle so the next signage session
+          // restarts it instead of reusing a socket that no longer listens.
+          server = null;
         }
       });
-      server.listen({ port: WS_PORT, host: '0.0.0.0' }, () => {
+      s.on('close', () => {
+        if (server === s) server = null;
+      });
+      s.listen({ port: WS_PORT, host: '0.0.0.0' }, () => {
         if (!settled) {
           settled = true;
+          server = s;
           resolve(WS_PORT);
         }
       });

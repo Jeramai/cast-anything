@@ -73,11 +73,22 @@ function sendStr(socket: any, data: string): Promise<void> {
   });
 }
 
-/** Write the status line + headers, resolving once they've actually flushed. */
-async function writeHead(socket: any, status: string, headers: Record<string, string>): Promise<void> {
+/**
+ * Write the status line + headers, resolving once they've actually flushed — or as
+ * soon as the socket dies. `sendStr` resolves only from the write callback, which
+ * may never fire on an already-closing socket, so we race it against `dead` (like
+ * the body loop) to avoid leaking a handler that hangs forever on a reset connection.
+ */
+async function writeHead(
+  socket: any,
+  status: string,
+  headers: Record<string, string>,
+  dead?: Promise<void>,
+): Promise<void> {
   let s = `HTTP/1.1 ${status}\r\n`;
   for (const [k, v] of Object.entries(headers)) s += `${k}: ${v}\r\n`;
-  await sendStr(socket, s + '\r\n');
+  const wrote = sendStr(socket, s + '\r\n');
+  await (dead ? Promise.race([wrote, dead]) : wrote);
 }
 
 /** Stream bytes [start,end] to the socket, pacing on each write's flush callback. */
@@ -160,7 +171,7 @@ async function handle(socket: any): Promise<void> {
     // Live stream (HLS→MPEG-TS remux): no size, no seek — stream until it ends.
     if (req.path.split('?')[0] === LIVE_PATH) {
       const plan = planLiveResponse(req, live, new Date().toUTCString());
-      await writeHead(socket, plan.status, plan.headers);
+      await writeHead(socket, plan.status, plan.headers, dead);
       if (plan.hasBody && live) await streamLive(socket, live, () => alive, dead);
       socket.end();
       return;
@@ -174,7 +185,7 @@ async function handle(socket: any): Promise<void> {
     if (!wantsSub && subtitleUrl && plan.hasBody !== undefined && plan.status !== '404 Not Found') {
       plan.headers['CaptionInfo.sec'] = subtitleUrl;
     }
-    await writeHead(socket, plan.status, plan.headers);
+    await writeHead(socket, plan.status, plan.headers, dead);
     if (plan.hasBody && f) await streamBytes(socket, f.path, plan.start, plan.end, () => alive, dead);
     socket.end();
   });
@@ -189,23 +200,35 @@ export function startMediaServer(): Promise<number> {
   startPromise = new Promise<number>((resolve, reject) => {
     let settled = false;
     try {
-      server = TcpSocket.createServer((socket: any) => {
+      const s = TcpSocket.createServer((socket: any) => {
         handle(socket).catch(() => {
           try {
             socket.destroy();
           } catch {}
         });
       });
-      server.on('error', (e: Error) => {
+      s.on('error', (e: Error) => {
         if (!settled) {
           settled = true;
-          server = null;
+          if (server === s) server = null;
           reject(e instanceof Error ? e : new Error(String(e)));
+        } else if (server === s) {
+          // Died AFTER startup (network drop, OS reclaim). Drop the dead handle so
+          // the next cast restarts it instead of reusing a socket that no longer
+          // accepts connections — otherwise the TV would fetch the URL, get nothing,
+          // and report a cryptic 716 "resource not found".
+          console.warn('[mediaServer] error after start; will restart on next use:', e?.message);
+          server = null;
         }
       });
-      server.listen({ port: MEDIA_PORT, host: '0.0.0.0' }, () => {
+      // A cached handle whose native socket has closed must not be reused as if healthy.
+      s.on('close', () => {
+        if (server === s) server = null;
+      });
+      s.listen({ port: MEDIA_PORT, host: '0.0.0.0' }, () => {
         if (!settled) {
           settled = true;
+          server = s;
           resolve(MEDIA_PORT);
         }
       });

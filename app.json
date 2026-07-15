@@ -2,7 +2,7 @@
   "expo": {
     "name": "Cast Anything",
     "slug": "Cast-anything",
-    "version": "1.0.0",
+    "version": "1.0.2",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
     "scheme": "castanything",
@@ -23,6 +23,7 @@
     },
     "android": {
       "package": "ai.jeram.castanything",
+      "versionCode": 3,
       "adaptiveIcon": {
         "backgroundColor": "#ffffff",
         "foregroundImage": "./assets/android-icon-foreground.png",

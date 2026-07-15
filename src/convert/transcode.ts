@@ -8,7 +8,12 @@ import {
 } from '@wokcito/ffmpeg-kit-react-native';
 import type { MediaItem } from '../media/mime';
 import { sanitizeFileName } from '../server/sanitize';
-import { assessForCast, buildConvertArgs, type MediaProbe } from './plan';
+import { assessForCast, buildConvertArgs, plan1080p, type EncodeOpts, type MediaProbe } from './plan';
+import {
+  cancelNativeTranscode,
+  nativeTranscoderAvailable,
+  transcodeToH264,
+} from '../../modules/cast-transcoder';
 
 /**
  * On-device media conversion for files a DLNA TV can't play. Most "unsupported"
@@ -44,11 +49,16 @@ export async function probeMedia(uri: string): Promise<MediaProbe> {
   const video = streams.find((s) => s.getType() === 'video');
   const audio = streams.find((s) => s.getType() === 'audio');
   const dur = parseFloat(String(info.getDuration() ?? '0'));
+  const width = video ? Number(video.getWidth()) : NaN;
+  const height = video ? Number(video.getHeight()) : NaN;
   return {
     container: info.getFormat() ?? '',
     videoCodec: video ? video.getCodec() : null,
     audioCodec: audio ? audio.getCodec() : null,
     durationSec: Number.isFinite(dur) ? dur : 0,
+    // Resolution gates the re-encode path (4K is declined) — best-effort.
+    width: Number.isFinite(width) && width > 0 ? width : undefined,
+    height: Number.isFinite(height) && height > 0 ? height : undefined,
   };
 }
 
@@ -87,14 +97,18 @@ export async function extractThumbnail(uri: string, atSec: number): Promise<stri
 
 let activeSessionId: number | null = null;
 
-/** Cancel an in-progress conversion, if any. */
+/** Cancel an in-progress conversion, if any (native transcoder or FFmpeg). */
 export async function cancelConvert(): Promise<void> {
+  cancelNativeTranscode();
   if (activeSessionId != null) await FFmpegKit.cancel(activeSessionId);
 }
 
 export interface ConvertOptions {
   /** Progress 0..1 (best-effort; based on processed time vs. duration). */
   onProgress?: (fraction: number) => void;
+  /** Force a ≤1080p H.264 output (the explicit "1080p" action) instead of the
+   *  minimal make-castable plan. Downscales 4K, re-encodes any non-H.264 source. */
+  to1080p?: boolean;
 }
 
 /**
@@ -106,7 +120,7 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
   if (!ffmpegAvailable) throw new Error('Conversion needs a rebuilt app (FFmpeg not in this binary).');
 
   const probe = await probeMedia(item.uri);
-  const plan = assessForCast(probe);
+  const plan = opts.to1080p ? plan1080p(probe) : assessForCast(probe);
   if (!plan.canConvert) throw new Error(plan.reason);
 
   if (!(await exists(FFMPEG_DIR))) await mkdir(FFMPEG_DIR);
@@ -115,38 +129,96 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
   if (await exists(outPath)) await unlink(outPath);
 
   const input = await ffmpegInput(item.uri);
-  const args = buildConvertArgs(input, outPath, plan);
-
   const total = probe.durationSec * 1000; // statistics report processed time in ms
+  const result: MediaItem = {
+    uri: `file://${outPath}`,
+    name: `${base}.mp4`,
+    mime: 'video/mp4',
+    kind: 'video',
+    isLocal: true,
+  };
 
-  return new Promise<MediaItem>((resolve, reject) => {
+  // Prefer the native zero-copy MediaCodec transcoder for a re-encode — it renders
+  // decoder→GPU→encoder through Surfaces (no per-frame CPU copies), so it's far
+  // faster than any FFmpeg path (which caps ~1.6x). Reads the content:// URI
+  // directly (no pre-copy). Falls back to FFmpeg if it's absent or fails.
+  if (plan.videoPlan === 'reencode' && nativeTranscoderAvailable) {
+    try {
+      if (await exists(outPath)) await unlink(outPath);
+      await transcodeToH264({
+        inputUri: item.uri,
+        outputPath: outPath,
+        maxHeight: 1080,
+        maxWidth: 1920,
+        onProgress: opts.onProgress,
+      });
+      return result;
+    } catch (e) {
+      if ((e as { cancelled?: boolean })?.cancelled) {
+        throw Object.assign(new Error('Conversion cancelled'), { cancelled: true });
+      }
+      console.warn('[convert] native transcoder failed; falling back to FFmpeg:', e);
+      // fall through to the FFmpeg attempts below
+    }
+  }
+
+  // FFmpeg fallback (only reached if the native transcoder above failed). The stock
+  // FFmpeg build has the MediaCodec hardware encoder but no software libx264, so we
+  // only try the hardware pipelines:
+  //   1. HW decode + HW encode   — fastest (both on the video silicon)
+  //   2. SW decode + HW encode   — some HW decoders reject a codec/10-bit profile
+  // A remux (video copy) has no encoder/decoder to vary, so it's a single attempt.
+  const attempts: EncodeOpts[] =
+    plan.videoPlan === 'reencode'
+      ? [
+          { hwDecode: true, hwEncode: true },
+          { hwDecode: false, hwEncode: true },
+        ]
+      : [{}];
+
+  for (let i = 0; i < attempts.length; i++) {
+    if (await exists(outPath)) await unlink(outPath);
+    if (i > 0) opts.onProgress?.(0);
+    const status = await runFfmpeg(buildConvertArgs(input, outPath, plan, attempts[i]), total, opts.onProgress);
+    if (status === 'ok') return result;
+    if (status === 'cancelled') {
+      throw Object.assign(new Error('Conversion cancelled'), { cancelled: true });
+    }
+    if (i < attempts.length - 1) {
+      console.warn(`[convert] encode attempt ${i + 1} failed (${JSON.stringify(attempts[i])}); trying next`);
+    }
+  }
+  throw new Error('Conversion failed');
+}
+
+type FfmpegStatus = 'ok' | 'cancelled' | 'failed';
+
+/** Run one FFmpeg session; resolves with its outcome (never rejects). */
+function runFfmpeg(
+  args: string[],
+  totalMs: number,
+  onProgress?: (fraction: number) => void,
+): Promise<FfmpegStatus> {
+  return new Promise<FfmpegStatus>((resolve) => {
+    // `settled` guards the session-id assignment below: a very fast/failed convert can
+    // fire the completion callback (which clears activeSessionId) *before* the
+    // executeWithArgumentsAsync promise resolves, which would otherwise leave a stale
+    // id that a later cancelConvert() would target.
+    let settled = false;
     FFmpegKit.executeWithArgumentsAsync(
       args,
       async (session) => {
         activeSessionId = null;
+        settled = true;
         const rc = await session.getReturnCode();
-        if (ReturnCode.isSuccess(rc)) {
-          resolve({
-            uri: `file://${outPath}`,
-            name: `${base}.mp4`,
-            mime: 'video/mp4',
-            kind: 'video',
-            isLocal: true,
-          });
-        } else if (ReturnCode.isCancel(rc)) {
-          reject(Object.assign(new Error('Conversion cancelled'), { cancelled: true }));
-        } else {
-          reject(new Error(`Conversion failed (code ${rc?.getValue?.() ?? '?'})`));
-        }
+        resolve(ReturnCode.isSuccess(rc) ? 'ok' : ReturnCode.isCancel(rc) ? 'cancelled' : 'failed');
       },
       undefined,
       (stats) => {
-        if (total > 0 && opts.onProgress) {
-          opts.onProgress(Math.max(0, Math.min(1, stats.getTime() / total)));
-        }
+        if (totalMs > 0 && onProgress) onProgress(Math.max(0, Math.min(1, stats.getTime() / totalMs)));
       },
     ).then((session) => {
-      activeSessionId = session.getSessionId();
+      if (!settled) activeSessionId = session.getSessionId();
     });
   });
 }

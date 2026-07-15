@@ -38,6 +38,7 @@ import {
   probeMedia,
   extractThumbnail,
 } from '../convert/transcode';
+import { assessForCast } from '../convert/plan';
 import { saveToGallery, type OutputMode } from '../convert/gallery';
 import { searchSubtitles, downloadSubtitle, type SubtitleResult } from '../subtitles/subdl';
 import { loadApiKey, saveApiKey } from '../subtitles/subtitleStore';
@@ -88,12 +89,32 @@ const seekUnsupportedDevices = new Set<string>();
 export type PlaybackStatus = TransportState | 'IDLE';
 
 function errMessage(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
+  if (e instanceof Error && e.message) return e.message;
+  if (typeof e === 'string') return e;
+  // Native modules (e.g. react-native-udp) sometimes emit plain objects that are
+  // NOT Error instances — `String(obj)` would render the useless "[object Object]".
+  // Pull a sensible message out of common shapes, else fall back to JSON.
+  if (e && typeof e === 'object') {
+    const o = e as Record<string, unknown>;
+    for (const key of ['message', 'error', 'code', 'reason'] as const) {
+      if (typeof o[key] === 'string' && o[key]) return o[key] as string;
+    }
+    try {
+      const json = JSON.stringify(e);
+      if (json && json !== '{}') return json;
+    } catch {
+      /* circular / non-serializable */
+    }
+  }
+  return String(e);
 }
 
 export interface UseCast {
   devices: DlnaDevice[];
   isScanning: boolean;
+  /** True once at least one scan has finished (to distinguish "not scanned yet"
+   *  from "scanned, found nothing"). */
+  scanCompleted: boolean;
   selectedDevice: DlnaDevice | null;
   /** The current selection (what a Cast press will send). */
   media: MediaItem | null;
@@ -132,13 +153,20 @@ export interface UseCast {
   canConvert: boolean;
   /** Copy progress (0–1) while a large local file is staged for casting; null otherwise. */
   castProgress: number | null;
+  /** True when the last cast was blocked (TV can't play the file) but it could be
+   *  served over HTTP instead — gates the "Stream via URL" fallback button. */
+  canStreamViaUrl: boolean;
+  /** The URL the picked file is being served at (for manual streaming), or null. */
+  streamUrl: string | null;
+  /** Serve the selected local file over HTTP and expose its URL as `streamUrl`. */
+  streamViaUrl: () => Promise<void>;
   /** True while a local conversion is running. */
   converting: boolean;
   /** Conversion progress, 0–1 (best-effort). */
   convertProgress: number;
   /** Convert the selected local file into a castable MP4, replacing the selection.
    *  `mode` controls whether the result is also saved to the gallery. */
-  convertSelected: (mode?: OutputMode) => Promise<void>;
+  convertSelected: (mode?: OutputMode, to1080p?: boolean) => Promise<void>;
   /** Cancel an in-progress conversion. */
   cancelConversion: () => void;
   // ---- Subtitles ----
@@ -164,6 +192,10 @@ export interface UseCast {
 export function useCast(): UseCast {
   const [devices, setDevices] = useState<DlnaDevice[]>([]);
   const [isScanning, setIsScanning] = useState(false);
+  // True once a scan has run to completion at least once. Lets the UI tell
+  // "you haven't scanned yet" apart from "scanned, found nothing" — the two
+  // otherwise look identical (empty device list, not scanning).
+  const [scanCompleted, setScanCompleted] = useState(false);
   const [selectedDevice, setSelectedDevice] = useState<DlnaDevice | null>(null);
   const [media, setMedia] = useState<MediaItem | null>(null);
   // What's actually on the TV — a snapshot taken when a cast succeeds. Kept
@@ -173,7 +205,7 @@ export function useCast(): UseCast {
   const [importing, setImporting] = useState(false);
   const [converting, setConverting] = useState(false);
   const [convertProgress, setConvertProgress] = useState(0);
-  // Subtitles (OpenSubtitles). subtitleUrlRef holds the served .srt URL passed to
+  // Subtitles (SUBDL). subtitleUrlRef holds the served .srt URL passed to
   // the renderer at cast time; `subtitle` is the attached label for the UI.
   const [subdlKey, setSubdlKeyState] = useState('');
   const [subResults, setSubResults] = useState<SubtitleResult[]>([]);
@@ -186,6 +218,12 @@ export function useCast(): UseCast {
   // Non-null while a large local file is being copied into the server dir before
   // the DLNA hand-off (0–1). Null when there's nothing to copy (remote/instant move).
   const [castProgress, setCastProgress] = useState<number | null>(null);
+  // "Stream via URL" fallback: when a picked file can't be DLNA-cast (e.g. a codec
+  // the TV can't decode), we offer to serve it over HTTP so the user can open the
+  // URL in a browser / player elsewhere. `canStreamViaUrl` gates the button;
+  // `streamUrl` holds the served URL once they opt in.
+  const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [canStreamViaUrl, setCanStreamViaUrl] = useState(false);
   // Bumped on each successful seek so the playback notification re-syncs its
   // timeline (we otherwise let the MediaSession extrapolate, ignoring polls).
   const [seekNonce, setSeekNonce] = useState(0);
@@ -300,6 +338,7 @@ export function useCast(): UseCast {
     if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
     setDevices([]);
     setError(null);
+    setScanCompleted(false);
     setIsScanning(true);
 
     discoveryRef.current = discoverDevices({
@@ -312,13 +351,21 @@ export function useCast(): UseCast {
       onError: (err) => setError(errMessage(err)),
     });
 
-    scanTimerRef.current = setTimeout(() => setIsScanning(false), SCAN_MS);
+    scanTimerRef.current = setTimeout(() => {
+      setIsScanning(false);
+      setScanCompleted(true);
+    }, SCAN_MS);
   }, []);
 
   const selectDevice = useCallback((d: DlnaDevice) => {
     setSelectedDevice(d);
     setVol(null); // volume is per-device; re-read on next cast
     setSeekSupported(!seekUnsupportedDevices.has(d.id));
+    // A different TV might play a file the last one couldn't, so clear the
+    // "can't cast this — stream it instead" fallback: the normal Cast button
+    // comes back so the user can retry on the newly-selected device.
+    setStreamUrl(null);
+    setCanStreamViaUrl(false);
   }, []);
 
   // Detach any subtitle (called when a different item is chosen — the subtitle
@@ -333,6 +380,8 @@ export function useCast(): UseCast {
 
   const chooseFile = useCallback(async () => {
     setError(null);
+    setStreamUrl(null);
+    setCanStreamViaUrl(false);
     // The OS picker copies the chosen file into our cache before resolving; for
     // a multi-GB file that takes a while (it runs natively, so the app stays
     // responsive — but show a spinner so it doesn't look dead).
@@ -354,6 +403,8 @@ export function useCast(): UseCast {
     (url: string) => {
       if (!url.trim()) return;
       setError(null);
+      setStreamUrl(null);
+      setCanStreamViaUrl(false);
       setMedia(mediaFromUrl(url));
       clearSubtitle();
     },
@@ -362,19 +413,25 @@ export function useCast(): UseCast {
 
   const clearMedia = useCallback(() => {
     setMedia(null);
+    setStreamUrl(null);
+    setCanStreamViaUrl(false);
     clearSubtitle();
   }, [clearSubtitle]);
 
-  // Convert the selected local file into a TV-friendly MP4 (remux + AAC), then
-  // swap it in as the selection so a normal Cast press streams the converted file.
+  // Convert the selected local file into a TV-friendly MP4, then swap it in as the
+  // selection so a normal Cast press streams the converted file. `to1080p` forces a
+  // ≤1080p H.264 re-encode (the "1080p" button) — for HEVC / 4K the TV can't play;
+  // otherwise it's the minimal make-castable plan (fast remux when possible).
   const convertSelected = useCallback(
-    async (mode: OutputMode = 'cache') => {
+    async (mode: OutputMode = 'cache', to1080p = false) => {
       if (!media || !media.isLocal) return;
       setError(null);
+      setStreamUrl(null);
+      setCanStreamViaUrl(false);
       setConverting(true);
       setConvertProgress(0);
       try {
-        const out = await convertForCast(media, { onProgress: setConvertProgress });
+        const out = await convertForCast(media, { onProgress: setConvertProgress, to1080p });
         setMedia(out);
         if (mode !== 'cache') {
           // Secondary to the cast: if the gallery save fails, the converted file
@@ -473,10 +530,15 @@ export function useCast(): UseCast {
     setBusy(true);
     setError(null);
     setSignage(null);
+    setStreamUrl(null);
+    setCanStreamViaUrl(false);
 
     // Samsung signage panels don't accept DLNA push — drive them over MDC.
     if (selectedDevice.isSignage) {
       try {
+        // Signage serves the media file + player page from the phone, so it needs
+        // the Doze exemption just as much as a DLNA cast does.
+        ensureBackgroundExemption();
         setSignage(await castToSignage(selectedDevice.address, media));
         setNowPlaying(media);
         setStatus('IDLE');
@@ -488,14 +550,44 @@ export function useCast(): UseCast {
       return;
     }
 
-    // A live HLS stream can't be pushed to most DLNA TVs as-is. When FFmpeg is
-    // present (Android) we remux it on-device into a continuous MPEG-TS feed the
-    // TV can play; otherwise we hand the TV the HLS URL directly (step-1 path,
-    // works on the sets that natively support HLS).
-    const usingRemux = media.live === true && ffmpegAvailable;
-    const servedFromPhone = media.isLocal || usingRemux;
+    // The item we actually cast — swapped for an on-device-converted copy below if
+    // the picked video is a codec the TV can't play (and small enough to re-encode).
+    let item = media;
+    let usingRemux = false;
+    let servedFromPhone = false;
+    let durationSec = 0;
 
     try {
+      // Probe local media up front: the duration feeds a seekable DLNA timeline
+      // (Samsung 701s on Seek without it), and for video the codec/resolution lets
+      // us catch files the TV can't play BEFORE copying gigabytes to serve them.
+      if (item.isLocal && ffmpegAvailable) {
+        let probe: Awaited<ReturnType<typeof probeMedia>> | undefined;
+        try {
+          probe = await probeMedia(item.uri);
+        } catch {
+          /* probe is best-effort */
+        }
+        if (probe) {
+          durationSec = probe.durationSec;
+          if (item.kind === 'video' && assessForCast(probe).videoPlan === 'reencode') {
+            // The TV can't play this codec as-is (e.g. HEVC). We don't silently start
+            // a (potentially very long) transcode from a Cast tap — instead point the
+            // user at the explicit "1080p" button, and offer the raw-URL fallback.
+            setError('Your TV can’t play this video as-is. Tap “1080p” to convert it first, or use Stream via URL.');
+            setCanStreamViaUrl(true);
+            return;
+          }
+        }
+      }
+
+      // A live HLS stream can't be pushed to most DLNA TVs as-is. When FFmpeg is
+      // present (Android) we remux it on-device into a continuous MPEG-TS feed the
+      // TV can play; otherwise we hand the TV the HLS URL directly (works on sets
+      // with native HLS). Computed AFTER any convert (a converted file is a plain MP4).
+      usingRemux = item.live === true && ffmpegAvailable;
+      servedFromPhone = item.isLocal || usingRemux;
+
       // A prior cast may have left a live remux running; tear it down unless we're
       // about to start a fresh one (serveLiveStream supersedes it on its own).
       if (!usingRemux) await stopLiveStream();
@@ -504,24 +596,11 @@ export function useCast(): UseCast {
       // ask for the battery-optimization exemption (once) so Doze doesn't drop it.
       if (servedFromPhone) ensureBackgroundExemption();
 
-      // Probe the duration up front (best-effort, local files) so BOTH the media
-      // server (TimeSeekRange → byte mapping) and the DIDL <res> can advertise a
-      // seekable timeline — Samsung rejects Seek with 701 without it. Live streams
-      // have no duration, so skip it for them.
-      let durationSec = 0;
-      if (media.isLocal && ffmpegAvailable) {
-        try {
-          durationSec = (await probeMedia(media.uri)).durationSec;
-        } catch {
-          /* duration is best-effort */
-        }
-      }
-
       // Grab a representative frame for the notification artwork (async, best-effort)
       // — the next poll-driven present (bumped by artworkNonce) picks it up.
-      if (media.isLocal && media.kind === 'video' && ffmpegAvailable) {
+      if (item.isLocal && item.kind === 'video' && ffmpegAvailable) {
         const at = durationSec > 0 ? Math.min(durationSec * 0.3, 120) : 5;
-        extractThumbnail(media.uri, at).then((p) => {
+        extractThumbnail(item.uri, at).then((p) => {
           if (p) {
             artworkPathRef.current = p;
             setArtworkNonce((n) => n + 1);
@@ -531,29 +610,29 @@ export function useCast(): UseCast {
 
       // The MIME we advertise to the TV: for a remux it's the MPEG-TS feed we now
       // serve, not the original playlist's `application/vnd.apple.mpegurl`.
-      let castMime = media.mime;
+      let castMime = item.mime;
       let url: string;
-      if (media.isLocal) {
-        url = await shareLocalFile(media.uri, media.name, {
-          mime: media.mime,
-          kind: media.kind,
+      if (item.isLocal) {
+        url = await shareLocalFile(item.uri, item.name, {
+          mime: item.mime,
+          kind: item.kind,
           durationSec: durationSec || undefined,
-          size: media.size,
+          size: item.size,
           onProgress: setCastProgress,
         });
       } else if (usingRemux) {
-        url = await serveLiveStream(media.uri);
+        url = await serveLiveStream(item.uri);
         castMime = 'video/mp2t';
       } else {
-        url = media.uri;
+        url = item.uri;
       }
       lastServedUrlRef.current = url; // for the byte-seek fallback
 
       console.log('[DLNA] casting', {
         url,
         mime: castMime,
-        kind: media.kind,
-        live: media.live === true,
+        kind: item.kind,
+        live: item.live === true,
         remux: usingRemux,
         device: selectedDevice.friendlyName,
         control: selectedDevice.avTransportControlURL,
@@ -571,41 +650,50 @@ export function useCast(): UseCast {
           );
         }
         // Confirm the phone is actually serving before involving the TV. (HEAD on
-        // the live path returns headers only — it doesn't consume any segments.)
+        // the live path returns headers only — it doesn't consume any segments.) A
+        // non-OK status means our own server can't serve the file (e.g. a stale/dead
+        // media-server handle after backgrounding) — the TV would just get the same
+        // and report a cryptic 716 "resource not found". Fail here with something
+        // actionable instead of handing the TV a broken URL.
+        let probeStatus = 0;
         try {
           const probe = await fetch(url, { method: 'HEAD' });
-          if (!probe.ok) {
-            console.warn('[DLNA] media server HEAD', probe.status, url);
-          }
+          probeStatus = probe.status;
         } catch (e) {
           throw new Error(
             `The phone's media server isn't reachable at ${url} ` +
               `(${errMessage(e)}). Casting can't continue.`,
           );
         }
+        if (probeStatus < 200 || probeStatus >= 400) {
+          throw new Error(
+            `The phone's media server returned ${probeStatus} for the file. ` +
+              `Please try casting again — if it keeps happening, reopen the app.`,
+          );
+        }
       }
 
       await castMedia(selectedDevice, {
         url,
-        title: media.name,
-        kind: media.kind,
+        title: item.name,
+        kind: item.kind,
         mime: castMime,
-        size: media.size,
+        size: item.size,
         durationSec: durationSec || undefined,
         subtitleUrl: subtitleUrlRef.current ?? undefined,
-        live: media.live === true,
+        live: item.live === true,
       });
-      setNowPlaying(media);
+      setNowPlaying(item);
       setStatus('PLAYING');
       setPosition(0);
       setDuration(0);
       // A live stream has no timeline to scrub, so don't offer seek for it.
       setSeekSupported(
-        !media.live && !seekUnsupportedDevices.has(selectedDevice.id),
+        !item.live && !seekUnsupportedDevices.has(selectedDevice.id),
       );
       startPolling(selectedDevice);
       // Photos have no volume; only sync it for audio/video.
-      if (media.kind !== 'image') refreshVolume(selectedDevice);
+      if (item.kind !== 'image') refreshVolume(selectedDevice);
     } catch (e) {
       const msg = errMessage(e);
       // A live remux that never reached playback is just burning CPU — stop it.
@@ -614,8 +702,8 @@ export function useCast(): UseCast {
       // flag. Fall back to the MDC / URL Launcher path.
       if (/\b402\b/.test(msg) && selectedDevice.address) {
         try {
-          setSignage(await castToSignage(selectedDevice.address, media));
-          setNowPlaying(media);
+          setSignage(await castToSignage(selectedDevice.address, item));
+          setNowPlaying(item);
           setStatus('IDLE');
           return;
         } catch (e2) {
@@ -631,6 +719,32 @@ export function useCast(): UseCast {
       setCastProgress(null);
     }
   }, [selectedDevice, media, startPolling]);
+
+  // Fallback for a file the TV can't DLNA-cast: serve it over HTTP and expose the
+  // URL so the user can open it in a browser / player on any device on the Wi-Fi.
+  // This is the one place a "blocked" local file is still materialized (copied) —
+  // opt-in, with copy progress — so we never copy gigabytes behind the user's back.
+  const streamViaUrl = useCallback(async () => {
+    if (!media || !media.isLocal) return;
+    setBusy(true);
+    setError(null);
+    try {
+      ensureBackgroundExemption(); // best-effort: keep serving with the screen off
+      const url = await shareLocalFile(media.uri, media.name, {
+        mime: media.mime,
+        kind: media.kind,
+        size: media.size,
+        onProgress: setCastProgress,
+      });
+      setStreamUrl(url);
+      setCanStreamViaUrl(false);
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setBusy(false);
+      setCastProgress(null);
+    }
+  }, [media]);
 
   const runAction = useCallback(
     async (fn: (device: DlnaDevice) => Promise<void>) => {
@@ -732,6 +846,7 @@ export function useCast(): UseCast {
           // mean the device can't seek, so they must never hide the controls.
           let definitelyUnsupported = true;
           let relCode: string | null = null;
+          let seekTimeCode: string | null = null;
           let byteCode: string | null = null;
           let triedByte = false;
 
@@ -744,6 +859,19 @@ export function useCast(): UseCast {
             relCode = codeOf(e);
             if (!isSeekFault(relCode)) throw e;
             if (relCode !== '710') definitelyUnsupported = false;
+          }
+
+          // (A2) Samsung's proprietary time seek — some sets reject REL_TIME (710)
+          // but honor X_DLNA_SeekTime with the same H:MM:SS target. (Only reached
+          // when REL_TIME faulted, so it never runs on sets that already seeked.)
+          try {
+            await seek(d, target, 'X_DLNA_SeekTime');
+            applyOk();
+            return;
+          } catch (e) {
+            seekTimeCode = codeOf(e);
+            if (!isSeekFault(seekTimeCode)) throw e;
+            if (seekTimeCode !== '710') definitelyUnsupported = false;
           }
 
           // (B) Byte seek fallback for renderers that prefer it.
@@ -774,7 +902,7 @@ export function useCast(): UseCast {
           if (definitelyUnsupported) {
             seekUnsupportedDevices.add(d.id);
             setSeekSupported(false);
-            const detail = `time ${relCode ?? '—'}${triedByte ? `, byte ${byteCode ?? '—'}` : ''}`;
+            const detail = `time ${relCode ?? '—'}/${seekTimeCode ?? '—'}${triedByte ? `, byte ${byteCode ?? '—'}` : ''}`;
             setError(`This TV doesn’t support seeking (${detail}).`);
           }
         } finally {
@@ -983,6 +1111,7 @@ export function useCast(): UseCast {
   return {
     devices,
     isScanning,
+    scanCompleted,
     selectedDevice,
     media,
     nowPlaying,
@@ -1020,6 +1149,9 @@ export function useCast(): UseCast {
     dismissError,
     dismissSignage,
     castProgress,
+    canStreamViaUrl,
+    streamUrl,
+    streamViaUrl,
     canConvert: ffmpegAvailable,
     converting,
     convertProgress,

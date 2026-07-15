@@ -1,0 +1,24 @@
+# Store-upload lane for the bare (non-EAS) build, ported from the auction/cadence
+# pipeline. Uploads the artifact produced by `npm run build:android:store`:
+#   Android -> ./app-release.aab
+# Run via `npm run submit:android`.
+
+ANDROID_AAB = "./app-release.aab".freeze
+
+platform :android do
+  desc "Upload the release .aab to the Play Store internal track"
+  lane :submit do
+    # Service-account JSON for the Google Play Developer API. Provide the path via
+    # GOOGLE_PLAY_JSON_KEY. This app is under the personal (gameout-501508) Play
+    # account, so use gameout's revenuecat-key.json — the auction key has no access.
+    upload_to_play_store(
+      track: "internal",
+      aab: ANDROID_AAB,
+      json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY"),
+      release_status: "completed",
+      skip_upload_metadata: true,
+      skip_upload_images: true,
+      skip_upload_screenshots: true
+    )
+  end
+end

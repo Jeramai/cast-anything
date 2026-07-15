@@ -249,7 +249,8 @@ export async function stop(device: DlnaDevice): Promise<void> {
 /**
  * Seek to an absolute position. `unit` defaults to the standard `REL_TIME`, but
  * Samsung renderers reject that with 701 and require their proprietary
- * `X_DLNA_SeekTime` instead (both take an "H:MM:SS" target). See {@link SEEK_UNITS}.
+ * `X_DLNA_SeekTime` instead (both take an "H:MM:SS" target); {@link seekBytes} adds
+ * a byte-offset fallback. The seek fallback chain lives in useCast's `onSeek`.
  */
 export async function seek(
   device: DlnaDevice,
