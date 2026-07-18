@@ -1,6 +1,16 @@
 /// <reference types="bun-types" />
 import { describe, expect, test } from "bun:test";
-import { extensionOf, guessMime, isHlsMime, kindFromMime, mediaFromUrl, HLS_MIME } from "./mime";
+import {
+  extensionOf,
+  guessMime,
+  isHlsMime,
+  isKnownMediaExtension,
+  kindFromMime,
+  mediaFromUrl,
+  mediaItemFromSafUri,
+  fileNameFromSafUri,
+  HLS_MIME,
+} from "./mime";
 
 describe("extensionOf", () => {
   test("lowercases and strips query/hash", () => {
@@ -74,5 +84,63 @@ describe("isHlsMime", () => {
   });
   test("false for plain video mimes", () => {
     expect(isHlsMime("video/mp4")).toBe(false);
+  });
+});
+
+describe("isKnownMediaExtension", () => {
+  test("true for recognized media extensions", () => {
+    expect(isKnownMediaExtension("clip.mkv")).toBe(true);
+    expect(isKnownMediaExtension("song.mp3")).toBe(true);
+    expect(isKnownMediaExtension("pic.JPG")).toBe(true);
+  });
+  test("false for non-media / extensionless", () => {
+    expect(isKnownMediaExtension("notes.txt")).toBe(false);
+    expect(isKnownMediaExtension("subfolder")).toBe(false);
+    expect(isKnownMediaExtension("archive.zip")).toBe(false);
+  });
+});
+
+describe("fileNameFromSafUri", () => {
+  test("decodes the file name from a SAF document URI", () => {
+    const uri =
+      "content://com.android.externalstorage.documents/tree/primary%3AMovies/document/primary%3AMovies%2FAvatar%2Fep1.mkv";
+    expect(fileNameFromSafUri(uri)).toBe("ep1.mkv");
+  });
+  test("strips the volume prefix from a root-level document id", () => {
+    expect(fileNameFromSafUri("content://x/document/primary%3Aclip.mp4")).toBe("clip.mp4");
+    expect(fileNameFromSafUri("content://x/document/1D04-2A08%3Asong.mp3")).toBe("song.mp3");
+  });
+  test("preserves colons that are part of the file name", () => {
+    const uri = "content://x/document/primary%3AMovies%2F12%3A30 recording.mp4";
+    expect(fileNameFromSafUri(uri)).toBe("12:30 recording.mp4");
+  });
+});
+
+describe("mediaItemFromSafUri", () => {
+  const uri = (docId: string) =>
+    `content://com.android.externalstorage.documents/tree/primary%3AMovies/document/${encodeURIComponent(docId)}`;
+
+  test("builds a MediaItem for a media file, keeping the content:// uri", () => {
+    const raw = uri("primary:Movies/ep1.mkv");
+    const item = mediaItemFromSafUri(raw);
+    expect(item).not.toBeNull();
+    expect(item?.uri).toBe(raw); // uri passed through untouched (pipeline handles content://)
+    expect(item?.name).toBe("ep1.mkv");
+    expect(item?.mime).toBe("video/x-matroska");
+    expect(item?.kind).toBe("video");
+    expect(item?.isLocal).toBe(true);
+  });
+
+  test("returns null for a non-media file (skipped in a folder scan)", () => {
+    expect(mediaItemFromSafUri(uri("primary:Movies/readme.txt"))).toBeNull();
+  });
+
+  test("returns null for a subdirectory (no media extension)", () => {
+    expect(mediaItemFromSafUri(uri("primary:Movies/Season 2"))).toBeNull();
+  });
+
+  test("classifies audio and image children by extension", () => {
+    expect(mediaItemFromSafUri(uri("primary:M/track.flac"))?.kind).toBe("audio");
+    expect(mediaItemFromSafUri(uri("primary:M/poster.png"))?.kind).toBe("image");
   });
 });

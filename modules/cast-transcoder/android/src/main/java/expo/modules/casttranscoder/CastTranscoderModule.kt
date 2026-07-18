@@ -3,13 +3,37 @@ package expo.modules.casttranscoder
 import android.net.Uri
 import com.otaliastudios.transcoder.Transcoder
 import com.otaliastudios.transcoder.TranscoderListener
+import com.otaliastudios.transcoder.common.TrackType
 import com.otaliastudios.transcoder.resize.AtMostResizer
 import com.otaliastudios.transcoder.strategy.DefaultAudioStrategy
 import com.otaliastudios.transcoder.strategy.DefaultVideoStrategy
+import com.otaliastudios.transcoder.time.TimeInterpolator
 import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 import java.util.concurrent.Future
+
+/**
+ * Forces each track's output timestamps to be strictly increasing. Some sources hand
+ * the muxer two samples at timestamp 0, which crashes it with "Timestamps must be
+ * monotonically increasing: 0, 0" (sending the transcode to the slow FFmpeg fallback).
+ * The library ships a MonotonicTimeInterpolator but it's `internal`, so we roll our own:
+ * per track, never emit a timestamp <= the previous one (bump by 1µs when needed).
+ */
+private class MonotonicInterpolator : TimeInterpolator {
+  private var lastVideo = Long.MIN_VALUE
+  private var lastAudio = Long.MIN_VALUE
+
+  override fun interpolate(type: TrackType, time: Long): Long {
+    return if (type == TrackType.VIDEO) {
+      lastVideo = if (time <= lastVideo) lastVideo + 1 else time
+      lastVideo
+    } else {
+      lastAudio = if (time <= lastAudio) lastAudio + 1 else time
+      lastAudio
+    }
+  }
+}
 
 /**
  * Hardware, (near) zero-copy transcode via deepmedia/Transcoder: the MediaCodec
@@ -29,18 +53,24 @@ class CastTranscoderModule : Module() {
 
     // Transcode `inputUri` (a content:// or file URI) to an H.264/AAC MP4 at
     // `outputPath`, downscaled to fit within maxWidth x maxHeight (aspect kept,
-    // downscale-only). Resolves with outputPath; rejects on failure/cancel.
-    AsyncFunction("transcode") { inputUri: String, outputPath: String, maxHeight: Int, maxWidth: Int, promise: Promise ->
+    // downscale-only). `maxFps` caps the output frame rate (0 = keep source) and
+    // `bitRate` (bits/s) sets the encoder target — both come from the user's chosen
+    // convert-quality preset and are the levers that make a re-encode faster.
+    // Resolves with outputPath; rejects on failure/cancel.
+    AsyncFunction("transcode") { inputUri: String, outputPath: String, maxHeight: Int, maxWidth: Int, maxFps: Int, bitRate: Double, promise: Promise ->
       val context = appContext.reactContext
       if (context == null) {
         promise.reject("ERR_NO_CONTEXT", "No React context available", null)
         return@AsyncFunction
       }
       try {
-        val video = DefaultVideoStrategy.Builder()
+        val videoBuilder = DefaultVideoStrategy.Builder()
           .addResizer(AtMostResizer(maxHeight, maxWidth)) // minor, major — downscale-only
-          .bitRate(8_000_000L)
-          .build()
+          .bitRate(bitRate.toLong())
+        // frameRate() caps only (won't invent frames), so applying it to a lower-fps
+        // source is harmless. 0 means "keep the source rate".
+        if (maxFps > 0) videoBuilder.frameRate(maxFps)
+        val video = videoBuilder.build()
         // Re-encode audio to AAC keeping the SOURCE channel count. Two dead ends we
         // avoid: forcing stereo throws "channel count not supported: 6" (the remixer
         // can't downmix >2 ch), and PassThroughTrackStrategy NPEs on this file's track
@@ -53,6 +83,9 @@ class CastTranscoderModule : Module() {
           .addDataSource(context, Uri.parse(inputUri))
           .setVideoTrackStrategy(video)
           .setAudioTrackStrategy(audio)
+          // Force monotonically-increasing timestamps so sources that hand the muxer
+          // two samples at ts 0 don't crash it (which would drop us to slow FFmpeg).
+          .setTimeInterpolator(MonotonicInterpolator())
           .setListener(object : TranscoderListener {
             override fun onTranscodeProgress(progress: Double) {
               sendEvent("onTranscodeProgress", mapOf("progress" to progress))

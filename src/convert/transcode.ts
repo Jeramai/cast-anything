@@ -8,12 +8,19 @@ import {
 } from '@wokcito/ffmpeg-kit-react-native';
 import type { MediaItem } from '../media/mime';
 import { sanitizeFileName } from '../server/sanitize';
-import { assessForCast, buildConvertArgs, plan1080p, type EncodeOpts, type MediaProbe } from './plan';
 import {
-  cancelNativeTranscode,
-  nativeTranscoderAvailable,
-  transcodeToH264,
-} from '../../modules/cast-transcoder';
+  assessForCast,
+  buildConvertArgs,
+  MAX_HEIGHT,
+  MAX_WIDTH,
+  type EncodeOpts,
+  type MediaProbe,
+} from './plan';
+import {
+  CONVERT_QUALITY_TUNING,
+  DEFAULT_CONVERT_QUALITY,
+  type ConvertQuality,
+} from './quality';
 
 /**
  * On-device media conversion for files a DLNA TV can't play. Most "unsupported"
@@ -34,7 +41,7 @@ export const ffmpegAvailable =
   Platform.OS === 'android' && !!NativeModules.FFmpegKitReactNativeModule;
 
 /** Resolve a picked uri to something FFmpeg can read (SAF token for content://). */
-async function ffmpegInput(uri: string): Promise<string> {
+export async function ffmpegInput(uri: string): Promise<string> {
   if (uri.startsWith('content://')) return FFmpegKitConfig.getSafParameterForRead(uri);
   return uri.replace(/^file:\/\//, '');
 }
@@ -51,6 +58,7 @@ export async function probeMedia(uri: string): Promise<MediaProbe> {
   const dur = parseFloat(String(info.getDuration() ?? '0'));
   const width = video ? Number(video.getWidth()) : NaN;
   const height = video ? Number(video.getHeight()) : NaN;
+  const fps = video ? parseFrameRate(video.getAverageFrameRate?.()) : 0;
   return {
     container: info.getFormat() ?? '',
     videoCodec: video ? video.getCodec() : null,
@@ -59,7 +67,18 @@ export async function probeMedia(uri: string): Promise<MediaProbe> {
     // Resolution gates the re-encode path (4K is declined) — best-effort.
     width: Number.isFinite(width) && width > 0 ? width : undefined,
     height: Number.isFinite(height) && height > 0 ? height : undefined,
+    fps: fps > 0 ? fps : undefined,
   };
+}
+
+/** ffprobe reports frame rate as a rational string ("24000/1001", "30/1"); to a number. */
+function parseFrameRate(rate?: string | null): number {
+  if (!rate) return 0;
+  const [num, den] = rate.split('/').map((n) => parseFloat(n));
+  if (!Number.isFinite(num)) return 0;
+  if (den === undefined) return num;
+  if (!Number.isFinite(den) || den === 0) return 0;
+  return num / den;
 }
 
 /**
@@ -97,18 +116,21 @@ export async function extractThumbnail(uri: string, atSec: number): Promise<stri
 
 let activeSessionId: number | null = null;
 
-/** Cancel an in-progress conversion, if any (native transcoder or FFmpeg). */
+/** Cancel an in-progress conversion, if any. All conversion runs through FFmpeg now;
+ *  the native MediaCodec transcoder (modules/cast-transcoder) is parked (see the
+ *  encode-path note in convertForCast) and never started, so there's nothing else to
+ *  cancel. */
 export async function cancelConvert(): Promise<void> {
-  cancelNativeTranscode();
   if (activeSessionId != null) await FFmpegKit.cancel(activeSessionId);
 }
 
 export interface ConvertOptions {
   /** Progress 0..1 (best-effort; based on processed time vs. duration). */
   onProgress?: (fraction: number) => void;
-  /** Force a ≤1080p H.264 output (the explicit "1080p" action) instead of the
-   *  minimal make-castable plan. Downscales 4K, re-encodes any non-H.264 source. */
-  to1080p?: boolean;
+  /** Speed/quality trade (resolution + frame-rate cap + bitrate) for the re-encode.
+   *  Also decides the target a larger source is downscaled to. Defaults to the app
+   *  default (favoring speed). */
+  quality?: ConvertQuality;
 }
 
 /**
@@ -120,8 +142,24 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
   if (!ffmpegAvailable) throw new Error('Conversion needs a rebuilt app (FFmpeg not in this binary).');
 
   const probe = await probeMedia(item.uri);
-  const plan = opts.to1080p ? plan1080p(probe) : assessForCast(probe);
+  // The user's speed/quality trade → concrete resolution, frame-rate cap, and bitrate.
+  const preset = CONVERT_QUALITY_TUNING[opts.quality ?? DEFAULT_CONVERT_QUALITY];
+  let plan = assessForCast(probe);
   if (!plan.canConvert) throw new Error(plan.reason);
+  // A source the TV itself can't display (>1080p) must be re-encoded even if it's
+  // already H.264 (a copy can't downscale) — this folds in the old "1080p" button.
+  const overTvCeiling = (probe.height ?? 0) > MAX_HEIGHT || (probe.width ?? 0) > MAX_WIDTH;
+  if (overTvCeiling && plan.videoPlan !== 'reencode') {
+    plan = { ...plan, videoPlan: 'reencode', downscale: true, compatible: false };
+  }
+  // The preset's box (e.g. Fastest = 720p) only shapes output when we're re-encoding
+  // ANYWAY. It must never force a re-encode by itself: a castable H.264 source within
+  // the TV ceiling keeps its fast lossless remux — otherwise the DEFAULT "fastest"
+  // preset would turn the most common case (1080p H.264 in an .mkv) from a
+  // seconds-long remux into a minutes-long lossy 720p re-encode.
+  const needScale =
+    plan.videoPlan === 'reencode' &&
+    ((probe.height ?? 0) > preset.maxHeight || (probe.width ?? 0) > preset.maxWidth);
 
   if (!(await exists(FFMPEG_DIR))) await mkdir(FFMPEG_DIR);
   const base = sanitizeFileName(item.name).replace(/\.[^.]+$/, '') || 'converted';
@@ -130,6 +168,20 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
 
   const input = await ffmpegInput(item.uri);
   const total = probe.durationSec * 1000; // statistics report processed time in ms
+  // Source-aware fps cap: only cap when the source is actually faster than the target,
+  // else 0 (keep source). FFmpeg's -r would otherwise DUPLICATE frames up to the target
+  // on a 24fps source — adding work, not removing it.
+  const effFps = probe.fps && probe.fps > preset.maxFps && preset.maxFps > 0 ? preset.maxFps : 0;
+  const scaleTo = needScale ? { w: preset.maxWidth, h: preset.maxHeight } : undefined;
+  const tuning = { maxFps: effFps, bitRateMbps: preset.bitRateMbps, scaleTo };
+  console.log('[convert] plan', {
+    quality: opts.quality ?? DEFAULT_CONVERT_QUALITY,
+    videoPlan: plan.videoPlan,
+    durationSec: Math.round(probe.durationSec),
+    src: { w: probe.width, h: probe.height, fps: probe.fps, codec: probe.videoCodec },
+    target: { maxH: preset.maxHeight, maxW: preset.maxWidth, fps: effFps || 'source', bitrateMbps: preset.bitRateMbps },
+    scale: scaleTo ?? 'none',
+  });
   const result: MediaItem = {
     uri: `file://${outPath}`,
     name: `${base}.mp4`,
@@ -138,33 +190,15 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
     isLocal: true,
   };
 
-  // Prefer the native zero-copy MediaCodec transcoder for a re-encode — it renders
-  // decoder→GPU→encoder through Surfaces (no per-frame CPU copies), so it's far
-  // faster than any FFmpeg path (which caps ~1.6x). Reads the content:// URI
-  // directly (no pre-copy). Falls back to FFmpeg if it's absent or fails.
-  if (plan.videoPlan === 'reencode' && nativeTranscoderAvailable) {
-    try {
-      if (await exists(outPath)) await unlink(outPath);
-      await transcodeToH264({
-        inputUri: item.uri,
-        outputPath: outPath,
-        maxHeight: 1080,
-        maxWidth: 1920,
-        onProgress: opts.onProgress,
-      });
-      return result;
-    } catch (e) {
-      if ((e as { cancelled?: boolean })?.cancelled) {
-        throw Object.assign(new Error('Conversion cancelled'), { cancelled: true });
-      }
-      console.warn('[convert] native transcoder failed; falling back to FFmpeg:', e);
-      // fall through to the FFmpeg attempts below
-    }
-  }
-
-  // FFmpeg fallback (only reached if the native transcoder above failed). The stock
-  // FFmpeg build has the MediaCodec hardware encoder but no software libx264, so we
-  // only try the hardware pipelines:
+  // Re-encode on the FFmpeg hardware path. (We used to prefer the native zero-copy
+  // MediaCodec transcoder, but on some devices — e.g. Pixel 9 / Tensor — SELinux
+  // denies the dma-buf access it needs, so it silently drops to a per-frame CPU copy
+  // and crawls at well under 1x realtime. FFmpeg's MediaCodec path is slower in theory
+  // but reliably ~2.5x here, so it's the one we use. The native module is still in the
+  // tree — see git history / modules/cast-transcoder — to revisit on unaffected devices.)
+  //
+  // The stock FFmpeg build has the MediaCodec hardware encoder but no software libx264,
+  // so we only try the hardware pipelines:
   //   1. HW decode + HW encode   — fastest (both on the video silicon)
   //   2. SW decode + HW encode   — some HW decoders reject a codec/10-bit profile
   // A remux (video copy) has no encoder/decoder to vary, so it's a single attempt.
@@ -179,7 +213,11 @@ export async function convertForCast(item: MediaItem, opts: ConvertOptions = {})
   for (let i = 0; i < attempts.length; i++) {
     if (await exists(outPath)) await unlink(outPath);
     if (i > 0) opts.onProgress?.(0);
-    const status = await runFfmpeg(buildConvertArgs(input, outPath, plan, attempts[i]), total, opts.onProgress);
+    const status = await runFfmpeg(
+      buildConvertArgs(input, outPath, plan, attempts[i], tuning),
+      total,
+      opts.onProgress,
+    );
     if (status === 'ok') return result;
     if (status === 'cancelled') {
       throw Object.assign(new Error('Conversion cancelled'), { cancelled: true });

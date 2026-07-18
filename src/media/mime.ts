@@ -75,6 +75,44 @@ export function guessMime(nameOrUrl: string, explicit?: string | null): string {
   return EXT_TO_MIME[ext] || 'video/mp4';
 }
 
+/** True if the name/URL ends in a media extension we recognize (video/audio/image). */
+export function isKnownMediaExtension(nameOrUrl: string): boolean {
+  return extensionOf(nameOrUrl) in EXT_TO_MIME;
+}
+
+/**
+ * Derive a display filename from a Storage Access Framework document URI. SAF URIs
+ * from `readDirectoryAsync` look like
+ * `content://…/document/primary%3AMovies%2FAvatar%2Fep1.mkv` — the file name is the
+ * last path segment of the URL-decoded document id. Returns null if it can't be
+ * decoded (opaque provider ids without a path).
+ */
+export function fileNameFromSafUri(uri: string): string | null {
+  try {
+    const decoded = decodeURIComponent(uri.split(/[?#]/)[0]);
+    let seg = decoded.split('/').filter(Boolean).pop() ?? '';
+    // A root-level document id looks like "primary:file.mp4" — strip the VOLUME
+    // prefix ("primary:", "home:", "raw:", or an SD-card id like "1D04-2A08:"), but
+    // never split on arbitrary colons: they can be part of a real file name
+    // ("12:30 recording.mp4").
+    seg = seg.replace(/^(primary|home|raw|[0-9A-F]{4}-[0-9A-F]{4}):/i, '');
+    return seg || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Turn a SAF folder-child URI into a MediaItem, or null if it isn't a media file
+ * (subdirectories and non-media files are skipped). Used by the "Add folder" flow.
+ */
+export function mediaItemFromSafUri(uri: string): MediaItem | null {
+  const name = fileNameFromSafUri(uri);
+  if (!name || !isKnownMediaExtension(name)) return null;
+  const mime = guessMime(name);
+  return { uri, name, mime, kind: kindFromMime(mime), isLocal: true };
+}
+
 /** Build a MediaItem for a remote URL the user typed in. */
 export function mediaFromUrl(url: string): MediaItem {
   const trimmed = url.trim();

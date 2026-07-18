@@ -195,3 +195,30 @@ export function pickReadySegment(
   const ready = running ? segs.filter((s) => s.index < maxIndex) : segs;
   return ready.length ? ready[0] : null;
 }
+
+/**
+ * Pure retention policy for the live segment dir: which segment files are stale and
+ * should be deleted. Keeps a rolling window of the last `retain` segments behind the
+ * newest. With `pinFirst`, seg #0 is never deleted — for an on-device TRANSCODE it's
+ * the only segment carrying the H.264 decoder headers (SPS/PPS; the hardware encoder
+ * writes them once at stream start, and every bitstream filter that could repeat them
+ * crashes this ffmpeg build), and every new reader connection starts there so it can
+ * initialize a decoder. An HLS REMUX passes pinFirst=false: broadcast streams repeat
+ * headers in-band, and replaying a stale seg #0 on reconnect would be a regression.
+ */
+export function pickStaleSegments(names: string[], retain: number, pinFirst: boolean): string[] {
+  let maxIndex = -1;
+  const segs: { name: string; index: number }[] = [];
+  for (const name of names) {
+    const m = /seg(\d+)\.ts$/.exec(name);
+    if (!m) continue;
+    const index = parseInt(m[1], 10);
+    segs.push({ name, index });
+    if (index > maxIndex) maxIndex = index;
+  }
+  const stale: string[] = [];
+  for (const s of segs) {
+    if ((pinFirst ? s.index > 0 : true) && s.index < maxIndex - retain) stale.push(s.name);
+  }
+  return stale;
+}

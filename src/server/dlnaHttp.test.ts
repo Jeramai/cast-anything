@@ -5,6 +5,7 @@ import {
   nptToSeconds,
   parseHttpHead,
   pickReadySegment,
+  pickStaleSegments,
   planLiveResponse,
   planResponse,
   type ServedFile,
@@ -179,5 +180,34 @@ describe("pickReadySegment", () => {
   test("ignores non-segment files and returns null when nothing is newer", () => {
     expect(pickReadySegment(["index.html", "seg000005.ts"], 5, false)).toBeNull();
     expect(pickReadySegment([], -1, true)).toBeNull();
+  });
+});
+
+describe("pickStaleSegments (rolling retention)", () => {
+  const seg = (i: number) => `seg${String(i).padStart(6, "0")}.ts`;
+
+  test("keeps everything while within the retention window", () => {
+    expect(pickStaleSegments([seg(0), seg(1), seg(2)], 8, true)).toEqual([]);
+  });
+
+  test("deletes segments older than newest-retain, but NEVER seg0 when pinned", () => {
+    const names = Array.from({ length: 13 }, (_, i) => seg(i)); // seg0..seg12
+    // newest=12, retain=8 → stale are 0<idx<4 → seg1..seg3 (seg0 pinned).
+    expect(pickStaleSegments(names, 8, true)).toEqual([seg(1), seg(2), seg(3)]);
+  });
+
+  test("pins seg0 no matter how far the stream has advanced", () => {
+    const names = [seg(0), seg(100), seg(101), seg(102)];
+    expect(pickStaleSegments(names, 2, true)).not.toContain(seg(0));
+  });
+
+  test("without the pin (HLS remux), seg0 ages out of the window like any other", () => {
+    const names = [seg(0), seg(100), seg(101), seg(102)];
+    expect(pickStaleSegments(names, 2, false)).toEqual([seg(0)]);
+  });
+
+  test("ignores non-segment files and handles empty dirs", () => {
+    expect(pickStaleSegments(["index.html", "current.json"], 4, true)).toEqual([]);
+    expect(pickStaleSegments([], 4, false)).toEqual([]);
   });
 });

@@ -1,6 +1,6 @@
 /// <reference types="bun-types" />
 import { describe, expect, test } from "bun:test";
-import { assessForCast, buildConvertArgs, plan1080p, type MediaProbe } from "./plan";
+import { assessForCast, buildConvertArgs, type MediaProbe } from "./plan";
 
 const probe = (p: Partial<MediaProbe>): MediaProbe => ({
   container: "",
@@ -79,31 +79,6 @@ describe("assessForCast", () => {
   });
 });
 
-describe("plan1080p (the explicit '1080p' button)", () => {
-  test("4K HEVC → re-encode + downscale", () => {
-    const a = plan1080p(probe({ container: "matroska", videoCodec: "hevc", audioCodec: "aac", width: 3840, height: 2160 }));
-    expect(a.videoPlan).toBe("reencode");
-    expect(a.downscale).toBe(true);
-  });
-
-  test("4K H.264 → re-encode + downscale (can't downscale by copy)", () => {
-    const a = plan1080p(probe({ container: "mp4", videoCodec: "h264", audioCodec: "aac", width: 3840, height: 2160 }));
-    expect(a.videoPlan).toBe("reencode");
-    expect(a.downscale).toBe(true);
-  });
-
-  test("1080p H.264 MP4 → no needless re-encode (delegates to normal plan)", () => {
-    const a = plan1080p(probe({ container: "mov,mp4,m4a", videoCodec: "h264", audioCodec: "aac", width: 1920, height: 1080 }));
-    expect(a.videoPlan).toBe("copy");
-  });
-
-  test("1080p HEVC → re-encode, no downscale", () => {
-    const a = plan1080p(probe({ container: "matroska", videoCodec: "hevc", audioCodec: "aac", width: 1920, height: 1080 }));
-    expect(a.videoPlan).toBe("reencode");
-    expect(a.downscale).toBeFalsy();
-  });
-});
-
 describe("buildConvertArgs", () => {
   const copyPlan = assessForCast(probe({ container: "matroska", videoCodec: "h264", audioCodec: "aac" }));
   const aacPlan = assessForCast(probe({ container: "matroska", videoCodec: "h264", audioCodec: "ac3" }));
@@ -168,5 +143,65 @@ describe("buildConvertArgs", () => {
     expect(
       buildConvertArgs("in", "/out.mp4", p, { hwDecode: true, hwEncode: true }).join(" "),
     ).toContain("scale=w=1920:h=1080");
+  });
+
+  const reencodePlan = assessForCast(
+    probe({ container: "matroska", videoCodec: "hevc", audioCodec: "aac", width: 1920, height: 1080 }),
+  );
+
+  test("tuning: custom bitrate flows into the HW encoder -b:v", () => {
+    const args = buildConvertArgs("in", "/out.mp4", reencodePlan, { hwEncode: true }, { bitRateMbps: 6 });
+    expect(args[args.indexOf("-b:v") + 1]).toBe("6M");
+  });
+
+  test("tuning: default bitrate stays 8M when unspecified", () => {
+    const args = buildConvertArgs("in", "/out.mp4", reencodePlan, { hwEncode: true });
+    expect(args[args.indexOf("-b:v") + 1]).toBe("8M");
+  });
+
+  test("tuning: maxFps adds -r on a re-encode, before -movflags", () => {
+    const args = buildConvertArgs("in", "/out.mp4", reencodePlan, { hwEncode: true }, { maxFps: 30 });
+    expect(args[args.indexOf("-r") + 1]).toBe("30");
+    // Still ends with the faststart output triplet (regression guard).
+    expect(args.slice(-3)).toEqual(["-movflags", "+faststart", "/out.mp4"]);
+  });
+
+  test("tuning: maxFps is NOT applied to a remux (video copy has no frames to drop)", () => {
+    const args = buildConvertArgs("in", "/out.mp4", copyPlan, {}, { maxFps: 30 });
+    expect(args).not.toContain("-r");
+  });
+
+  test("tuning: maxFps 0 (keep source) adds no -r", () => {
+    const args = buildConvertArgs("in", "/out.mp4", reencodePlan, { hwEncode: true }, { maxFps: 0 });
+    expect(args).not.toContain("-r");
+  });
+
+  test("tuning: scaleTo emits a scale filter at the requested target (720p)", () => {
+    const args = buildConvertArgs(
+      "in",
+      "/out.mp4",
+      reencodePlan,
+      { hwEncode: true },
+      { scaleTo: { w: 1280, h: 720 } },
+    );
+    expect(args.join(" ")).toContain("scale=w=1280:h=720");
+  });
+
+  test("tuning: scaleTo overrides the default 1080p downscale on a 4K plan", () => {
+    const p4k = assessForCast(
+      probe({ container: "matroska", videoCodec: "hevc", audioCodec: "aac", width: 3840, height: 2160 }),
+    );
+    const joined = buildConvertArgs("in", "/out.mp4", p4k, { hwEncode: true }, { scaleTo: { w: 1280, h: 720 } }).join(
+      " ",
+    );
+    expect(joined).toContain("scale=w=1280:h=720");
+    expect(joined).not.toContain("scale=w=1920:h=1080");
+  });
+
+  test("tuning: no scaleTo on a non-4K reencode → no scale filter", () => {
+    // reencodePlan is a 1080p source (downscale falsy); without scaleTo, no scaling.
+    expect(buildConvertArgs("in", "/out.mp4", reencodePlan, { hwEncode: true }).join(" ")).not.toContain(
+      "scale=",
+    );
   });
 });

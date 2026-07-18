@@ -31,7 +31,9 @@ import * as SystemUI from "expo-system-ui";
 import * as Clipboard from "expo-clipboard";
 import type { DlnaDevice } from "./src/dlna";
 import { useCast } from "./src/hooks/useCast";
+import type { MediaItem } from "./src/media/mime";
 import type { OutputMode } from "./src/convert/gallery";
+import { CONVERT_QUALITY_LABELS } from "./src/convert/quality";
 import { setScreenAwake } from "./src/background/keepAlive";
 import {
   ACCENTS,
@@ -204,8 +206,18 @@ function NowPlayingSheet({
 }) {
   const { styles } = useTheme();
   const PEEK = 96;
-  const EXPANDED = isImage ? 180 : 330;
+  // A multi-item queue adds a Prev/Shuffle/Repeat/Next row, so the card needs more
+  // height when expanded.
+  const hasQueue = !isImage && cast.queue.length > 1;
+  const EXPANDED = isImage ? 180 : hasQueue ? 400 : 330;
   const range = EXPANDED - PEEK; // how far it slides down to collapse
+  // The card's height (hence `range`) changes at runtime: a photo, or growing the
+  // queue past one item, resizes the expanded card. The PanResponder below is created
+  // once and would otherwise capture the FIRST render's `range` forever — clamping and
+  // snap thresholds would use a stale height. Mirror `range` into a ref the handlers
+  // read live.
+  const rangeRef = useRef(range);
+  rangeRef.current = range;
 
   // Lazy-init so the Animated.Value isn't reconstructed on every render.
   const translateYRef = useRef<Animated.Value | null>(null);
@@ -213,6 +225,16 @@ function NowPlayingSheet({
   const translateY = translateYRef.current; // start collapsed (peek)
   const offset = useRef(range);
   const [expanded, setExpanded] = useState(false);
+
+  // When `range` changes while the card rests collapsed, re-pin it to the new bottom
+  // so it doesn't hang mid-slide (old range) or over-collapse. The expanded rest
+  // position is 0 regardless of range, so only the collapsed case needs re-syncing.
+  useEffect(() => {
+    if (!expanded) {
+      offset.current = range;
+      translateY.setValue(range);
+    }
+  }, [range, expanded, translateY]);
 
   // 0 = collapsed (peek), 1 = expanded. Drives the play/pause cross-fade so the
   // small corner icon and the big central button are never both visible at rest —
@@ -241,23 +263,30 @@ function NowPlayingSheet({
     }).start();
   };
 
+  // snapTo is redefined each render (fresh `range`), but the PanResponder captures the
+  // FIRST one, so route its calls through a ref that tracks the latest.
+  const snapToRef = useRef(snapTo);
+  snapToRef.current = snapTo;
+
   const barWidthRef = useRef(0);
   const panRef = useRef<ReturnType<typeof PanResponder.create> | null>(null);
   if (panRef.current === null) {
     panRef.current = PanResponder.create({
       onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dy) > 4,
       onPanResponderMove: (_e, g) => {
-        translateY.setValue(Math.min(range, Math.max(0, offset.current + g.dy)));
+        const r = rangeRef.current;
+        translateY.setValue(Math.min(r, Math.max(0, offset.current + g.dy)));
       },
       onPanResponderRelease: (_e, g) => {
+        const r = rangeRef.current;
         // A tap (negligible drag) toggles; a real drag snaps by direction/position.
         if (Math.abs(g.dy) < 6 && Math.abs(g.vy) < 0.2) {
-          snapTo(offset.current > range / 2 ? 0 : range);
+          snapToRef.current(offset.current > r / 2 ? 0 : r);
           return;
         }
         const next = offset.current + g.dy;
-        const expand = g.vy < -0.4 || (g.vy <= 0.4 && next < range / 2);
-        snapTo(expand ? 0 : range);
+        const expand = g.vy < -0.4 || (g.vy <= 0.4 && next < r / 2);
+        snapToRef.current(expand ? 0 : r);
       },
     });
   }
@@ -338,6 +367,26 @@ function NowPlayingSheet({
               </Text>
             </View>
 
+            {hasQueue && (
+              <View style={styles.controls}>
+                <Button icon="play-skip-back" onPress={cast.previous} style={styles.grow} />
+                <Button
+                  icon="shuffle"
+                  variant={cast.shuffle ? "primary" : "secondary"}
+                  onPress={cast.toggleShuffle}
+                  style={styles.grow}
+                />
+                <Button
+                  icon="repeat"
+                  title={cast.repeatMode === "one" ? "1" : cast.repeatMode === "all" ? "∞" : undefined}
+                  variant={cast.repeatMode !== "off" ? "primary" : "secondary"}
+                  onPress={cast.cycleRepeat}
+                  style={styles.grow}
+                />
+                <Button icon="play-skip-forward" onPress={cast.next} style={styles.grow} />
+              </View>
+            )}
+
             <View style={styles.controls}>
               {cast.seekSupported && (
                 <Button icon="play-back" title="15" onPress={() => cast.onSeek(Math.max(0, cast.position - 15))} />
@@ -379,6 +428,92 @@ function NowPlayingSheet({
   );
 }
 
+// A queue row you can tap to play, or swipe left/right to remove. Uses the same
+// PanResponder + Animated approach as the now-playing sheet (no gesture-handler dep).
+// The horizontal-only responder (dx must dominate dy) leaves vertical scrolling to
+// the surrounding ScrollView.
+const SWIPE_REMOVE_PX = 120;
+
+// A stable, unique React key per queue item. Queue items are distinct object
+// instances (two adds of the same file are still separate objects), and their
+// references survive queue add/remove (spread/filter preserve them), so a WeakMap
+// hands each a key that stays put when a sibling is removed. An index- or uri-based
+// key makes a surviving duplicate reuse a just-swiped-away QueueRow — it inherits
+// that row's translateX≈600 and renders off-screen.
+let queueKeySeq = 0;
+const queueKeys = new WeakMap<MediaItem, string>();
+function queueKey(item: MediaItem): string {
+  let k = queueKeys.get(item);
+  if (!k) {
+    k = `q${queueKeySeq++}`;
+    queueKeys.set(item, k);
+  }
+  return k;
+}
+
+function QueueRow({
+  item,
+  active,
+  onPlay,
+  onRemove,
+}: {
+  item: MediaItem;
+  active: boolean;
+  onPlay: () => void;
+  onRemove: () => void;
+}) {
+  const { C, styles } = useTheme();
+  const translateXRef = useRef<Animated.Value | null>(null);
+  if (translateXRef.current === null) translateXRef.current = new Animated.Value(0);
+  const translateX = translateXRef.current;
+  const panRef = useRef<ReturnType<typeof PanResponder.create> | null>(null);
+  if (panRef.current === null) {
+    panRef.current = PanResponder.create({
+      onMoveShouldSetPanResponder: (_e, g) => Math.abs(g.dx) > Math.abs(g.dy) && Math.abs(g.dx) > 8,
+      onPanResponderMove: (_e, g) => translateX.setValue(g.dx),
+      onPanResponderRelease: (_e, g) => {
+        if (Math.abs(g.dx) > SWIPE_REMOVE_PX) {
+          Animated.timing(translateX, {
+            toValue: g.dx > 0 ? 600 : -600,
+            duration: 160,
+            useNativeDriver: true,
+          }).start(() => onRemove());
+        } else {
+          Animated.spring(translateX, { toValue: 0, useNativeDriver: true, bounciness: 4 }).start();
+        }
+      },
+    });
+  }
+  return (
+    <Animated.View style={{ transform: [{ translateX }] }} {...panRef.current.panHandlers}>
+      <Pressable
+        onPress={onPlay}
+        style={[styles.queueRow, active && styles.queueRowActive]}
+      >
+        <Ionicons
+          name={
+            active
+              ? "play"
+              : item.kind === "audio"
+                ? "musical-notes"
+                : item.kind === "image"
+                  ? "image"
+                  : "film"
+          }
+          size={16}
+          color={active ? C.accent : C.textDim}
+        />
+        <Text style={styles.queueName} numberOfLines={1}>
+          {item.name}
+        </Text>
+        <Pressable onPress={onRemove} hitSlop={10}>
+          <Ionicons name="close" size={16} color={C.textDim} />
+        </Pressable>
+      </Pressable>
+    </Animated.View>
+  );
+}
+
 function CastScreen() {
   const { C, styles, baseKey, accentKey, setBaseKey, setAccentKey } = useTheme();
   const cast = useCast();
@@ -387,9 +522,6 @@ function CastScreen() {
   const barWidthRef = useRef(0);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [convertOpen, setConvertOpen] = useState(false);
-  // True when the convert dialog was opened via the "1080p" button (force a ≤1080p
-  // H.264 re-encode) rather than the plain "Convert" (minimal make-castable) button.
-  const [convert1080p, setConvert1080p] = useState(false);
   const [subsOpen, setSubsOpen] = useState(false);
   const [subLang, setSubLang] = useState("en");
   // Where a conversion's output goes: cache only, or also saved to the gallery.
@@ -467,59 +599,25 @@ function CastScreen() {
 
         {/* ---- Media ---- */}
         <Section title="2 · Choose what to cast">
+          {/* Add files (one → the selection below; several → straight to the queue),
+              or a whole folder → the queue. Or paste a URL. */}
           <View style={styles.pickRow}>
             <Button
-              icon={cast.importing ? undefined : "folder-open"}
-              title={cast.importing ? "Importing…" : "Pick a file"}
+              icon={cast.importing ? undefined : "albums"}
+              title={cast.importing ? "Importing…" : "Add files"}
               loading={cast.importing}
-              onPress={cast.chooseFile}
-              style={{ flex: 1 }}
+              onPress={cast.addMedia}
+              style={styles.grow}
             />
-          </View>
-          {/* Secondary actions on their own row so they each have room. Convert makes
-              an unsupported local file TV-friendly (fast remux when possible); 1080p
-              forces a ≤1080p H.264 re-encode for HEVC/4K files the TV can't play; Subs
-              attaches an .srt. All need FFmpeg (Convert/1080p) or a video (Subs). */}
-          <View style={[styles.pickRow, { marginTop: 8 }]}>
-            {cast.canConvert && (
-              <Button
-                icon="sync"
-                title="Convert"
-                disabled={!(cast.media?.isLocal && cast.media.kind !== "image")}
-                onPress={() => {
-                  setConvert1080p(false);
-                  setConvertOpen(true);
-                }}
-                style={{ flex: 1 }}
-              />
-            )}
-            {cast.canConvert && (
-              <Button
-                icon="tv"
-                title="1080p"
-                disabled={!(cast.media?.isLocal && cast.media.kind === "video")}
-                onPress={() => {
-                  setConvert1080p(true);
-                  setConvertOpen(true);
-                }}
-                style={{ flex: 1 }}
-              />
-            )}
             <Button
-              icon="chatbox-ellipses"
-              title={cast.subtitle ? cast.subtitle.language.toUpperCase() : "Subs"}
-              variant={cast.subtitle ? "primary" : "secondary"}
-              disabled={cast.media?.kind !== "video"}
-              onPress={() => setSubsOpen(true)}
-              style={{ flex: 1 }}
+              icon="folder"
+              title="Add folder"
+              disabled={cast.importing}
+              onPress={cast.addFolder}
+              style={styles.grow}
             />
           </View>
-          {cast.importing && (
-            <Text style={styles.hint}>
-              Copying the file into the app — large files can take a moment.
-            </Text>
-          )}
-          <View style={styles.urlRow}>
+          <View style={[styles.urlRow, { marginTop: 8 }]}>
             <TextInput
               value={urlInput}
               onChangeText={setUrlInput}
@@ -539,29 +637,88 @@ function CastScreen() {
               }}
             />
           </View>
+
+          {/* The single selected file, with only the actions that apply to it. */}
           {cast.media && (
-            <View style={styles.mediaCard}>
-              <Ionicons
-                name={
-                  cast.media.kind === "audio"
-                    ? "musical-notes"
-                    : cast.media.kind === "image"
-                      ? "image"
-                      : "film"
-                }
-                size={20}
-                color={C.accent}
-              />
-              <Text style={styles.mediaKind}>{cast.media.kind.toUpperCase()}</Text>
-              <Text style={styles.mediaName} numberOfLines={1}>
-                {cast.media.name}
-              </Text>
-              <Pressable onPress={cast.clearMedia} hitSlop={10}>
-                <Ionicons name="close" size={18} color={C.textDim} />
-              </Pressable>
-            </View>
+            <>
+              <View style={[styles.mediaCard, { marginTop: 8 }]}>
+                <Ionicons
+                  name={
+                    cast.media.kind === "audio"
+                      ? "musical-notes"
+                      : cast.media.kind === "image"
+                        ? "image"
+                        : "film"
+                  }
+                  size={20}
+                  color={C.accent}
+                />
+                <Text style={styles.mediaKind}>{cast.media.kind.toUpperCase()}</Text>
+                <Text style={styles.mediaName} numberOfLines={1}>
+                  {cast.media.name}
+                </Text>
+                <Pressable onPress={cast.clearMedia} hitSlop={10}>
+                  <Ionicons name="close" size={18} color={C.textDim} />
+                </Pressable>
+              </View>
+              <View style={[styles.pickRow, { marginTop: 8 }]}>
+                {cast.canConvert && cast.media.isLocal && cast.media.kind !== "image" && (
+                  <Button
+                    icon="sync"
+                    title="Convert"
+                    onPress={() => setConvertOpen(true)}
+                    style={styles.grow}
+                  />
+                )}
+                {cast.media.kind === "video" && (
+                  <Button
+                    icon="chatbox-ellipses"
+                    title={cast.subtitle ? cast.subtitle.language.toUpperCase() : "Subs"}
+                    variant={cast.subtitle ? "primary" : "secondary"}
+                    onPress={() => setSubsOpen(true)}
+                    style={styles.grow}
+                  />
+                )}
+                <Button icon="add" title="Queue" onPress={cast.enqueue} style={styles.grow} />
+              </View>
+            </>
           )}
         </Section>
+
+        {/* ---- Queue ---- */}
+        {cast.queue.length > 0 && (
+          <Section title="Queue">
+            {cast.queue.map((it, i) => (
+              <QueueRow
+                key={queueKey(it)}
+                item={it}
+                active={i === cast.queueIndex}
+                onPlay={() => cast.playQueueAt(i)}
+                onRemove={() => cast.removeFromQueue(i)}
+              />
+            ))}
+            <Text style={styles.hint}>Tap to play · swipe a row to remove.</Text>
+            <View style={styles.queueActions}>
+              <Button
+                icon="shuffle"
+                title="Shuffle"
+                variant={cast.shuffle ? "primary" : "secondary"}
+                onPress={cast.toggleShuffle}
+                style={styles.grow}
+              />
+              <Button
+                icon="repeat"
+                title={
+                  cast.repeatMode === "one" ? "One" : cast.repeatMode === "all" ? "All" : "Repeat"
+                }
+                variant={cast.repeatMode !== "off" ? "primary" : "secondary"}
+                onPress={cast.cycleRepeat}
+                style={styles.grow}
+              />
+              <Button icon="trash" variant="ghost" onPress={cast.clearQueue} />
+            </View>
+          </Section>
+        )}
 
         {/* ---- Cast ---- */}
         {/* While a big local file copies into the server dir, the button itself
@@ -573,11 +730,17 @@ function CastScreen() {
         {!(cast.canStreamViaUrl || cast.streamUrl) && (
           <Button
             icon="play-circle"
-            title={cast.selectedDevice?.isSignage ? "Send to signage" : "Cast to device"}
+            title={
+              cast.selectedDevice?.isSignage
+                ? "Send to signage"
+                : cast.queue.length > 0
+                  ? `Play queue (${cast.queue.length})`
+                  : "Cast to device"
+            }
             variant="primary"
             loading={cast.busy}
             progress={cast.castProgress}
-            disabled={!cast.selectedDevice || !cast.media}
+            disabled={!cast.selectedDevice || (!cast.media && cast.queue.length === 0)}
             onPress={cast.cast}
             style={{ marginTop: 4 }}
           />
@@ -608,9 +771,20 @@ function CastScreen() {
             ) : (
               <>
                 <Text style={styles.hint}>
-                  Your TV can’t cast this file, but the phone can serve it so you can
-                  play it in a browser or media-player app elsewhere.
+                  Your TV can’t play this file as-is. Play it now while the phone
+                  converts it (starts in seconds, no seeking) — or use “Convert” above for
+                  a seekable saved copy, or serve it to another player over the network.
                 </Text>
+                {cast.media?.isLocal && cast.media.kind === "video" && cast.canConvert && (
+                  <Button
+                    icon="play-circle"
+                    title="Play now (converts as it plays)"
+                    variant="primary"
+                    loading={cast.busy}
+                    onPress={cast.playNow}
+                    style={{ marginTop: 8 }}
+                  />
+                )}
                 <Button
                   icon="link-outline"
                   title="Stream via URL instead"
@@ -835,9 +1009,7 @@ function CastScreen() {
         >
           <Pressable style={styles.modalCard} onPress={() => {}}>
             <View style={styles.modalHeader}>
-              <Text style={styles.modalTitle}>
-                {convert1080p ? "Convert to 1080p" : "Convert for TV"}
-              </Text>
+              <Text style={styles.modalTitle}>Convert for TV</Text>
               <Pressable
                 onPress={() => setConvertOpen(false)}
                 hitSlop={10}
@@ -852,12 +1024,30 @@ function CastScreen() {
                 {cast.media.name}
               </Text>
             )}
-            {convert1080p && (
-              <Text style={styles.hint}>
-                Re-encodes to 1080p H.264 (downscaling 4K). Makes HEVC / 4K files your
-                TV can’t play castable — slower than a plain Convert.
-              </Text>
-            )}
+
+            <Text style={styles.themeLabel}>Speed</Text>
+            <View style={styles.themeRow}>
+              {CONVERT_QUALITY_LABELS.map((q) => (
+                <Pressable
+                  key={q.key}
+                  onPress={() => cast.setConvertQuality(q.key)}
+                  disabled={cast.converting}
+                  style={[styles.outChip, cast.convertQuality === q.key && styles.outChipOn]}
+                >
+                  <Text
+                    style={[
+                      styles.outChipText,
+                      cast.convertQuality === q.key && styles.outChipTextOn,
+                    ]}
+                  >
+                    {q.label}
+                  </Text>
+                </Pressable>
+              ))}
+            </View>
+            <Text style={styles.hint}>
+              {CONVERT_QUALITY_LABELS.find((q) => q.key === cast.convertQuality)?.hint}
+            </Text>
 
             <Text style={styles.themeLabel}>Save</Text>
             <View style={styles.themeRow}>
@@ -887,7 +1077,11 @@ function CastScreen() {
                 <Button
                   variant="primary"
                   progress={cast.convertProgress}
-                  progressLabel="Converting"
+                  progressLabel={
+                    cast.convertEtaSec != null
+                      ? `Converting · ${formatTime(cast.convertEtaSec)} left`
+                      : "Converting…"
+                  }
                   style={{ marginTop: 14 }}
                 />
                 <Button
@@ -904,7 +1098,7 @@ function CastScreen() {
                 title="Convert"
                 variant="primary"
                 onPress={async () => {
-                  await cast.convertSelected(outMode, convert1080p);
+                  await cast.convertSelected(outMode);
                   setConvertOpen(false);
                 }}
                 style={{ marginTop: 14 }}
@@ -1194,6 +1388,19 @@ function makeStyles(C: ThemePalette) {
   mediaName: { color: C.text, fontSize: 14, flex: 1 },
   clearX: { color: C.textDim, fontSize: 16, fontWeight: "700" },
   pickRow: { flexDirection: "row", gap: 10 },
+  queueRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 10,
+    paddingVertical: 9,
+    paddingHorizontal: 10,
+    borderRadius: 10,
+    backgroundColor: C.card,
+    marginBottom: 6,
+  },
+  queueRowActive: { backgroundColor: C.accentDim },
+  queueName: { color: C.text, fontSize: 13, flex: 1 },
+  queueActions: { flexDirection: "row", gap: 8, marginTop: 4 },
   subActiveRow: {
     flexDirection: "row",
     alignItems: "center",

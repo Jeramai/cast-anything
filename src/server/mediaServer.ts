@@ -6,18 +6,24 @@ import { parseHttpHead, planLiveResponse, planResponse, type ServedFile } from '
 export type { ServedFile };
 
 /**
- * A live, unbounded stream (our HLS→MPEG-TS remux). Unlike a {@link ServedFile} it
- * has no size or seek — the server just pulls complete segments via `next()` and
- * deletes each one through `done()` once it's been sent.
+ * A live, unbounded stream (our HLS→MPEG-TS remux or on-the-fly local transcode).
+ * Unlike a {@link ServedFile} it has no size or seek — each HTTP connection gets its
+ * own reader that pulls complete segments in order; segment deletion/retention is the
+ * source's rolling-window job, never the reader's.
  */
 export interface LiveSource {
   mime: string;
   /** `contentFeatures.dlna.org` value (must carry the live flags). */
   features: string;
-  /** Next complete segment path, or null once the feed has ended. */
-  next: (alive: () => boolean) => Promise<string | null>;
-  /** Called after a segment has been fully sent — delete it. */
-  done: (path: string) => void;
+  /**
+   * Create an independent reader for one HTTP connection. Each reader walks the
+   * retained segments from the very start (seg #0 carries the H.264 decoder headers)
+   * to the live edge with its OWN cursor — readers never consume destructively, so
+   * the renderer's short probe GET can no longer steal the header-bearing first
+   * segment from the real playback GET (which left playback undecodable and stuck in
+   * TRANSITIONING). Retention/deletion is the source's own rolling-window job.
+   */
+  createReader: () => { next: (alive: () => boolean) => Promise<string | null> };
   /** Stop producing (cast stopped / superseded). */
   stop: () => void;
 }
@@ -41,7 +47,12 @@ export const LIVE_PATH = '/live.ts';
  */
 
 export const MEDIA_PORT = 51797;
-const CHUNK = 256 * 1024;
+// 1 MB chunks (was 256 KB). Every chunk costs two JS↔native bridge round-trips
+// (disk read + socket write) plus a base64 marshal, so bigger chunks = 4× fewer of
+// that fixed per-chunk overhead — the difference between "just barely keeps up" and
+// "keeps the TV's buffer full". Peak memory stays tiny: at most two chunks in flight
+// (see the read-ahead in streamBytes).
+const CHUNK = 1024 * 1024;
 
 let server: any = null;
 let current: ServedFile | null = null;
@@ -91,7 +102,32 @@ async function writeHead(
   await (dead ? Promise.race([wrote, dead]) : wrote);
 }
 
-/** Stream bytes [start,end] to the socket, pacing on each write's flush callback. */
+/**
+ * Read one chunk of [pos, pos+len) from disk and decode it to bytes. Returns null
+ * on read error or EOF so callers can just stop. Kept separate so the read+decode of
+ * the *next* chunk can be kicked off (and run on the bridge) while the current one is
+ * still draining to the socket — see the read-ahead in streamBytes.
+ */
+async function readChunk(path: string, len: number, pos: number): Promise<Buffer | null> {
+  try {
+    const b64 = await read(path, len, pos, 'base64');
+    const buf = Buffer.from(b64 || '', 'base64');
+    return buf.length ? buf : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Stream bytes [start,end] to the socket, pacing on each write's flush callback.
+ *
+ * Pipelined: while the current chunk is draining to the socket we've already kicked
+ * off the disk read + base64 decode of the NEXT one, so disk I/O overlaps network
+ * I/O instead of running strictly one-after-the-other. That roughly doubles sustained
+ * throughput — the difference between the TV's buffer draining (→ it stalls to
+ * re-buffer) and staying comfortably full. At most two chunks are ever in flight, so
+ * memory stays bounded — we never read the whole file ahead of the socket.
+ */
 async function streamBytes(
   socket: any,
   path: string,
@@ -101,16 +137,18 @@ async function streamBytes(
   dead: Promise<void>,
 ): Promise<void> {
   let pos = start;
+  // Prime the pipeline: begin reading the first chunk before the loop.
+  let pending: Promise<Buffer | null> =
+    pos <= end ? readChunk(path, Math.min(CHUNK, end - pos + 1), pos) : Promise.resolve(null);
   while (pos <= end && alive()) {
-    const len = Math.min(CHUNK, end - pos + 1);
-    let b64: string;
-    try {
-      b64 = await read(path, len, pos, 'base64');
-    } catch {
-      break;
-    }
-    const buf = Buffer.from(b64 || '', 'base64');
-    if (buf.length === 0) break;
+    const buf = await pending;
+    if (!buf) break;
+    pos += buf.length;
+    // Kick off the next read NOW, so it runs while we await this chunk's flush below.
+    pending =
+      pos <= end && alive()
+        ? readChunk(path, Math.min(CHUNK, end - pos + 1), pos)
+        : Promise.resolve(null);
     // Await the flush so we don't read the whole file into memory faster than the
     // socket can drain it — natural backpressure. Race it against socket death so a
     // mid-stream disconnect (the renderer seeking away) can't hang the handler.
@@ -119,7 +157,6 @@ async function streamBytes(
     }).catch(() => {});
     await Promise.race([wrote, dead]);
     if (!alive()) break;
-    pos += buf.length;
   }
 }
 
@@ -134,13 +171,29 @@ async function streamLive(
   alive: () => boolean,
   dead: Promise<void>,
 ): Promise<void> {
+  // Own cursor per connection: this stream always starts at seg #0 (decoder headers)
+  // regardless of what other connections (e.g. the renderer's probe) have read.
+  const reader = src.createReader();
+  let sent = 0;
+  const t0 = Date.now();
   while (alive()) {
-    const seg = await src.next(alive);
+    const waitStart = Date.now();
+    const seg = await reader.next(alive);
     if (seg == null || !alive()) break;
+    const waitedMs = Date.now() - waitStart; // time spent waiting for the segment to be ready
     const size = (await stat(seg).catch(() => null))?.size ?? 0;
+    const sendStart = Date.now();
     if (size > 0) await streamBytes(socket, seg, 0, size - 1, alive, dead);
-    src.done(seg);
+    const sendMs = Date.now() - sendStart; // time spent pushing it to the TV (socket-paced)
+    sent++;
+    // waitedMs high → encoder is the bottleneck; sendMs high → the TV is pulling slowly
+    // (its buffer is full / Wi-Fi ceiling). The real filename shows WHICH underlying
+    // segment this connection got.
+    console.log(
+      `[live-serve] ${seg.split('/').pop()} (#${sent} on this conn) ${(size / 1024).toFixed(0)}KB wait=${waitedMs}ms send=${sendMs}ms elapsed=${((Date.now() - t0) / 1000).toFixed(1)}s`,
+    );
   }
+  console.log(`[live-serve] connection closed after ${sent} segments, ${((Date.now() - t0) / 1000).toFixed(0)}s`);
 }
 
 async function handle(socket: any): Promise<void> {
@@ -151,11 +204,14 @@ async function handle(socket: any): Promise<void> {
   const dead = new Promise<void>((r) => {
     resolveDead = r;
   });
+  let liveConn = false; // only log lifecycle noise for the live stream, not every file read
   socket.on('close', () => {
+    if (liveConn) console.log('[live-serve] socket closed by peer (TV)');
     alive = false;
     resolveDead();
   });
-  socket.on('error', () => {
+  socket.on('error', (e: Error) => {
+    if (liveConn) console.log(`[live-serve] socket error: ${e?.message ?? e}`);
     alive = false;
     resolveDead();
   });
@@ -170,6 +226,10 @@ async function handle(socket: any): Promise<void> {
 
     // Live stream (HLS→MPEG-TS remux): no size, no seek — stream until it ends.
     if (req.path.split('?')[0] === LIVE_PATH) {
+      liveConn = true;
+      console.log(
+        `[live-serve] ${req.method} ${req.path} — TV connected (range=${req.headers['range'] ?? 'none'}, ua=${req.headers['user-agent'] ?? '?'}, conn=${req.headers['connection'] ?? '?'})`,
+      );
       const plan = planLiveResponse(req, live, new Date().toUTCString());
       await writeHead(socket, plan.status, plan.headers, dead);
       if (plan.hasBody && live) await streamLive(socket, live, () => alive, dead);

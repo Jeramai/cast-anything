@@ -26,7 +26,12 @@ import {
   SUBTITLE_PATH,
   LIVE_PATH,
 } from './mediaServer';
-import { startLiveRemux, stopLiveRemux } from '../convert/liveStream';
+import {
+  startLiveRemux,
+  startLiveTranscode,
+  stopLiveRemux,
+  type LiveTranscodeTuning,
+} from '../convert/liveStream';
 
 /**
  * Serves locally-picked media over HTTP so a TV on the same Wi-Fi can stream it.
@@ -427,7 +432,23 @@ export async function serveLiveStream(srcUrl: string): Promise<string> {
   return `http://${ip}:${MEDIA_PORT}${LIVE_PATH}`;
 }
 
-/** Stop any live remux and detach it from the media server. Idempotent. */
+/**
+ * Transcode a local file on-the-fly (HEVC → H.264) and serve it as a continuous
+ * MPEG-TS feed the TV can play immediately — "play while transcoding". Returns the
+ * URL the TV should stream from. (Android only — guarded by ffmpegAvailable upstream.)
+ */
+export async function serveTranscodedFile(
+  localUri: string,
+  tuning: LiveTranscodeTuning,
+): Promise<string> {
+  await startMediaServer();
+  const ip = await getLanIp();
+  // startLiveTranscode resolves the SAF/file input itself (fresh per retry attempt).
+  setLiveSource(await startLiveTranscode(localUri, tuning));
+  return `http://${ip}:${MEDIA_PORT}${LIVE_PATH}`;
+}
+
+/** Stop any live remux/transcode and detach it from the media server. Idempotent. */
 export async function stopLiveStream(): Promise<void> {
   setLiveSource(null);
   await stopLiveRemux();

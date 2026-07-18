@@ -29,6 +29,7 @@ import {
   serveSubtitle,
   clearServedSubtitle,
   serveLiveStream,
+  serveTranscodedFile,
   stopLiveStream,
 } from '../server/fileServer';
 import {
@@ -39,6 +40,20 @@ import {
   extractThumbnail,
 } from '../convert/transcode';
 import { assessForCast } from '../convert/plan';
+import {
+  CONVERT_QUALITY_TUNING,
+  DEFAULT_CONVERT_QUALITY,
+  type ConvertQuality,
+} from '../convert/quality';
+import { loadConvertQuality, saveConvertQuality } from '../convert/qualityStore';
+import {
+  advance,
+  anchorOrder,
+  indexAfterRemoval,
+  makeOrder,
+  retreat,
+  type RepeatMode,
+} from '../media/playlist';
 import { saveToGallery, type OutputMode } from '../convert/gallery';
 import { searchSubtitles, downloadSubtitle, type SubtitleResult } from '../subtitles/subdl';
 import { loadApiKey, saveApiKey } from '../subtitles/subtitleStore';
@@ -68,9 +83,10 @@ export interface SignageControls {
 }
 import {
   mediaFromUrl,
-  pickMedia,
+  pickMediaFiles,
   type MediaItem,
 } from '../media/media';
+import { pickFolderMedia } from '../media/folder';
 
 const SCAN_MS = 6000;
 const POLL_MS = 1500;
@@ -79,6 +95,11 @@ const POLL_MS = 1500;
 // reporting PLAYING with the clock frozen at the last second. We treat a
 // non-advancing position within this window of the end as end-of-media.
 const END_EPSILON_S = 2;
+// A terminal STOPPED this close to the end (seconds) counts as the media finishing
+// (→ queue may auto-advance); further away it's the user stopping from the TV remote
+// (→ tear down). Wider than END_EPSILON_S because some renderers reset the position
+// a beat before reporting STOPPED.
+const END_STOP_NEAR_S = 10;
 
 // Devices that rejected every seek mode (e.g. Samsung "The Freestyle" advertises
 // Seek but its renderer refuses it for pushed content). Remembered by device id
@@ -137,10 +158,12 @@ export interface UseCast {
   signageControls: SignageControls;
   scan: () => void;
   selectDevice: (d: DlnaDevice) => void;
-  chooseFile: () => Promise<void>;
   chooseUrl: (url: string) => void;
   clearMedia: () => void;
   cast: () => Promise<void>;
+  /** Play the selected local video now by transcoding it on the fly (starts in
+   *  seconds; no seeking). The instant alternative to a full up-front Convert. */
+  playNow: () => Promise<void>;
   onPlay: () => Promise<void>;
   onPause: () => Promise<void>;
   onStop: () => Promise<void>;
@@ -164,11 +187,46 @@ export interface UseCast {
   converting: boolean;
   /** Conversion progress, 0–1 (best-effort). */
   convertProgress: number;
+  /** Estimated seconds remaining for the running conversion, or null. */
+  convertEtaSec: number | null;
   /** Convert the selected local file into a castable MP4, replacing the selection.
    *  `mode` controls whether the result is also saved to the gallery. */
-  convertSelected: (mode?: OutputMode, to1080p?: boolean) => Promise<void>;
+  convertSelected: (mode?: OutputMode) => Promise<void>;
   /** Cancel an in-progress conversion. */
   cancelConversion: () => void;
+  /** The chosen convert speed/quality preset (persisted). */
+  convertQuality: ConvertQuality;
+  /** Change the convert speed/quality preset. */
+  setConvertQuality: (q: ConvertQuality) => void;
+  // ---- Playlist ----
+  /** The playback queue (built with `enqueue`). Empty = single-shot casting. */
+  queue: MediaItem[];
+  /** Index of the currently-playing queue item, or -1 when not playing from the queue. */
+  queueIndex: number;
+  /** Whether the queue plays in a shuffled order. */
+  shuffle: boolean;
+  /** Repeat behavior: off / repeat-all / repeat-one. */
+  repeatMode: RepeatMode;
+  /** Append the current selection (`media`) to the queue and clear the selection. */
+  enqueue: () => void;
+  /** Pick one file (→ selection) or many (→ queue) via the system picker. */
+  addMedia: () => Promise<void>;
+  /** Pick a folder and append every media file directly inside it to the queue. */
+  addFolder: () => Promise<void>;
+  /** Remove the item at `index` from the queue (adjusts the current index). */
+  removeFromQueue: (index: number) => void;
+  /** Empty the queue. */
+  clearQueue: () => void;
+  /** Jump to and play a specific queue item now. */
+  playQueueAt: (index: number) => void;
+  /** Skip to the next queue item (honors shuffle/repeat). */
+  next: () => void;
+  /** Go back to the previous queue item (honors shuffle/repeat). */
+  previous: () => void;
+  /** Toggle shuffled playback. */
+  toggleShuffle: () => void;
+  /** Cycle repeat mode: off → all → one → off. */
+  cycleRepeat: () => void;
   // ---- Subtitles ----
   /** Saved SUBDL API key (empty until the user sets one). */
   subdlKey: string;
@@ -205,6 +263,18 @@ export function useCast(): UseCast {
   const [importing, setImporting] = useState(false);
   const [converting, setConverting] = useState(false);
   const [convertProgress, setConvertProgress] = useState(0);
+  // Estimated seconds remaining for the current conversion (null until enough progress
+  // to extrapolate, and while idle).
+  const [convertEtaSec, setConvertEtaSec] = useState<number | null>(null);
+  const [convertQuality, setConvertQualityState] = useState<ConvertQuality>(DEFAULT_CONVERT_QUALITY);
+  // ---- Playlist ----
+  // The queue is empty for the classic single-shot flow (Cast one file); once the
+  // user enqueues items it becomes the playback source, with auto-advance on
+  // end-of-media plus shuffle/repeat. `queueIndex` is the currently-playing slot.
+  const [queue, setQueue] = useState<MediaItem[]>([]);
+  const [queueIndex, setQueueIndex] = useState(-1);
+  const [shuffle, setShuffle] = useState(false);
+  const [repeatMode, setRepeatMode] = useState<RepeatMode>('off');
   // Subtitles (SUBDL). subtitleUrlRef holds the served .srt URL passed to
   // the renderer at cast time; `subtitle` is the attached label for the UI.
   const [subdlKey, setSubdlKeyState] = useState('');
@@ -261,6 +331,25 @@ export function useCast(): UseCast {
   const statusRef = useRef<PlaybackStatus>('IDLE');
   statusRef.current = status;
 
+  // Playlist state mirrored into refs so the poll-driven auto-advance and the
+  // (stable) navigation callbacks read the latest queue without being re-created.
+  const queueRef = useRef<MediaItem[]>([]);
+  const queueIndexRef = useRef(-1);
+  const orderRef = useRef<number[]>([]);
+  const shuffleRef = useRef(false);
+  const repeatRef = useRef<RepeatMode>('off');
+  // Points at the latest castNext each render; finishPlayback (created below, before
+  // castNext exists) calls it through this ref to auto-advance without a def-order cycle.
+  const castNextRef = useRef<(manual: boolean) => boolean>(() => false);
+  // True only while playback was started FROM the queue. Gates auto-advance: finishing
+  // a one-off cast ("Play now" / single Cast) must never auto-start a parked queue.
+  const playingFromQueueRef = useRef(false);
+  // Monotonic cast sequence. Every castItem run takes a number; any later cast (or a
+  // Stop/teardown) bumps it, making the older in-flight run "stale" so it aborts before
+  // committing state or sending the TV a superseded SetAVTransportURI — rapid Next taps
+  // and Stop-during-auto-advance would otherwise race on the single served-file slot.
+  const castSeqRef = useRef(0);
+
   const stopPolling = useCallback(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
@@ -268,17 +357,40 @@ export function useCast(): UseCast {
     }
   }, []);
 
-  // The video finished on the TV (or was stopped by its own remote): drop the
-  // notification, hide the Now-Playing sheet, and stop any on-device remux so
-  // FFmpeg isn't left running. Mirrors onStop, minus the DLNA Stop call (the TV
-  // has already stopped itself).
-  const finishPlayback = useCallback(() => {
+  // Tear down all playback state: notification/keep-alive, the Now-Playing sheet,
+  // any on-device remux/transcode, the queue cursor, and any in-flight cast.
+  const teardownPlayback = useCallback(() => {
     stopPolling();
+    castSeqRef.current++; // abort any in-flight castItem before it commits
+    playingFromQueueRef.current = false;
+    queueIndexRef.current = -1;
+    setQueueIndex(-1);
     setStatus('STOPPED'); // → castActive becomes false → keep-alive/notification torn down
     setPosition(0);
     setNowPlaying(null);
+    setBusy(false); // an aborted in-flight cast skips its own busy-reset
+    setCastProgress(null);
     stopLiveStream().catch(() => {});
   }, [stopPolling]);
+
+  // Playback finished on the TV. `endedNaturally` distinguishes reaching the end of
+  // the media (may auto-advance the queue) from the user stopping it with the TV's
+  // own remote (must tear down — auto-advancing there would make the queue impossible
+  // to stop from the TV). Stop the poll first so it can't fire again mid-advance.
+  const finishPlayback = useCallback(
+    (endedNaturally: boolean) => {
+      stopPolling();
+      // Only auto-advance when the media actually finished AND we were playing from
+      // the queue. A finished one-off ("Play now" / single Cast) with a parked queue
+      // must NOT jump into that queue.
+      if (endedNaturally && playingFromQueueRef.current && castNextRef.current(false)) {
+        return;
+      }
+      console.log('[cast] finishPlayback: tearing down — stopping live stream');
+      teardownPlayback();
+    },
+    [stopPolling, teardownPlayback],
+  );
 
   const startPolling = useCallback(
     (device: DlnaDevice) => {
@@ -295,6 +407,13 @@ export function useCast(): UseCast {
           // hit Stop), don't clobber the IDLE status the stop just set — otherwise
           // the device's post-stop "STOPPED" reappears and the sheet pops back.
           if (!pollRef.current) return;
+          const prevPos = prevPollPosRef.current;
+          // Whether the clock is advancing tells working (pos rising) from stalled
+          // (state PLAYING but pos frozen) at a glance in the log.
+          const advancing = pos.position !== prevPos;
+          console.log(
+            `[poll] state=${transport.state} pos=${pos.position} dur=${pos.duration} advancing=${advancing}`,
+          );
           setStatus(transport.state);
           setPosition(pos.position);
           setDuration(pos.duration);
@@ -319,14 +438,27 @@ export function useCast(): UseCast {
             transport.state === 'PLAYING' &&
             pos.duration > 0 &&
             pos.position >= pos.duration - END_EPSILON_S &&
-            pos.position === prevPollPosRef.current;
+            pos.position === prevPos;
           prevPollPosRef.current = pos.position;
 
           if ((terminal || frozenAtEnd) && playbackSeenRef.current) {
-            finishPlayback();
+            // A STOPPED near the end of the timeline is the media finishing; a STOPPED
+            // far from it is the user pressing Stop on the TV's own remote — only the
+            // former may auto-advance the queue (else the TV can't stop a queue at
+            // all). With no known duration we can't tell, so we let it advance.
+            const dur = pos.duration > 0 ? pos.duration : durationRef.current;
+            const nearEnd =
+              dur <= 0 || pos.position >= dur - END_STOP_NEAR_S || prevPos >= dur - END_STOP_NEAR_S;
+            const endedNaturally = frozenAtEnd || (terminal && nearEnd);
+            console.log(
+              `[poll] END detected (terminal=${terminal} frozenAtEnd=${frozenAtEnd} endedNaturally=${endedNaturally}) → finishPlayback`,
+            );
+            finishPlayback(endedNaturally);
           }
-        } catch {
-          /* transient network blip; keep polling */
+        } catch (e) {
+          // Was swallowed as a "transient blip" — but a poll error can mean the TV
+          // dropped the control channel (its player crashed), so surface it.
+          console.log(`[poll] error: ${errMessage(e)}`);
         }
       }, POLL_MS);
     },
@@ -378,27 +510,6 @@ export function useCast(): UseCast {
     artworkPathRef.current = null; // also drop the old item's notification frame
   }, []);
 
-  const chooseFile = useCallback(async () => {
-    setError(null);
-    setStreamUrl(null);
-    setCanStreamViaUrl(false);
-    // The OS picker copies the chosen file into our cache before resolving; for
-    // a multi-GB file that takes a while (it runs natively, so the app stays
-    // responsive — but show a spinner so it doesn't look dead).
-    setImporting(true);
-    try {
-      const item = await pickMedia();
-      if (item) {
-        setMedia(item);
-        clearSubtitle();
-      }
-    } catch (e) {
-      setError(errMessage(e));
-    } finally {
-      setImporting(false);
-    }
-  }, [clearSubtitle]);
-
   const chooseUrl = useCallback(
     (url: string) => {
       if (!url.trim()) return;
@@ -419,19 +530,32 @@ export function useCast(): UseCast {
   }, [clearSubtitle]);
 
   // Convert the selected local file into a TV-friendly MP4, then swap it in as the
-  // selection so a normal Cast press streams the converted file. `to1080p` forces a
-  // ≤1080p H.264 re-encode (the "1080p" button) — for HEVC / 4K the TV can't play;
-  // otherwise it's the minimal make-castable plan (fast remux when possible).
+  // selection so a normal Cast press streams the converted file. The chosen quality
+  // preset owns the output resolution: a source larger than the preset's target is
+  // downscaled + re-encoded; a compatible in-target file is a fast remux.
   const convertSelected = useCallback(
-    async (mode: OutputMode = 'cache', to1080p = false) => {
+    async (mode: OutputMode = 'cache') => {
       if (!media || !media.isLocal) return;
       setError(null);
       setStreamUrl(null);
       setCanStreamViaUrl(false);
       setConverting(true);
       setConvertProgress(0);
+      setConvertEtaSec(null);
+      const startedAt = Date.now();
       try {
-        const out = await convertForCast(media, { onProgress: setConvertProgress, to1080p });
+        const out = await convertForCast(media, {
+          onProgress: (frac) => {
+            setConvertProgress(frac);
+            // Extrapolate time remaining from the elapsed/fraction rate once there's
+            // enough signal (past the first few %) that it isn't wildly noisy.
+            if (frac > 0.03) {
+              const elapsed = (Date.now() - startedAt) / 1000;
+              setConvertEtaSec(Math.max(0, Math.round(elapsed / frac - elapsed)));
+            }
+          },
+          quality: convertQuality,
+        });
         setMedia(out);
         if (mode !== 'cache') {
           // Secondary to the cast: if the gallery save fails, the converted file
@@ -446,13 +570,24 @@ export function useCast(): UseCast {
         if (!(e as { cancelled?: boolean })?.cancelled) setError(errMessage(e));
       } finally {
         setConverting(false);
+        setConvertEtaSec(null);
       }
     },
-    [media],
+    [media, convertQuality],
   );
 
   const cancelConversion = useCallback(() => {
     cancelConvert();
+  }, []);
+
+  // Load the persisted convert speed/quality preset once.
+  useEffect(() => {
+    loadConvertQuality().then(setConvertQualityState);
+  }, []);
+
+  const setConvertQuality = useCallback((q: ConvertQuality) => {
+    setConvertQualityState(q);
+    saveConvertQuality(q);
   }, []);
 
   // ---- Subtitles ----
@@ -518,15 +653,31 @@ export function useCast(): UseCast {
     }
   }, []);
 
-  const cast = useCallback(async () => {
+  // Cast a specific item now. The public `cast`, the queue navigators, and the
+  // poll-driven auto-advance all funnel through here — it owns the signage-vs-DLNA
+  // decision, on-device serving, the reachability probe, and starting the poll. The
+  // CALLER owns the queue index (this just plays whatever item it's handed).
+  // `liveTranscode` streams a local file the TV can't play by re-encoding it on the
+  // fly (play-while-transcoding) instead of blocking for a full up-front convert.
+  // `fromQueue` marks queue-initiated casts, which can't use the single-selection
+  // fallback UI (Play now / Stream via URL need `media`, which a queue item isn't).
+  //
+  // Returns the outcome so queue logic can react: 'ok' (playing), 'failed' (error
+  // surfaced — the queue should tear down rather than stay stuck "PLAYING"), or
+  // 'superseded' (a newer cast/Stop took over mid-flight — do nothing).
+  const castItem = useCallback(
+    async (
+      item: MediaItem,
+      castOpts: { liveTranscode?: boolean; fromQueue?: boolean } = {},
+    ): Promise<'ok' | 'failed' | 'superseded'> => {
     if (!selectedDevice) {
       setError('Pick a TV / device first.');
-      return;
+      return 'failed';
     }
-    if (!media) {
-      setError('Choose a file or enter a URL first.');
-      return;
-    }
+    // Claim the cast slot: any later cast or Stop bumps the sequence, and this run
+    // aborts at its next checkpoint instead of committing stale state.
+    const seq = ++castSeqRef.current;
+    const stale = () => seq !== castSeqRef.current;
     setBusy(true);
     setError(null);
     setSignage(null);
@@ -539,53 +690,76 @@ export function useCast(): UseCast {
         // Signage serves the media file + player page from the phone, so it needs
         // the Doze exemption just as much as a DLNA cast does.
         ensureBackgroundExemption();
-        setSignage(await castToSignage(selectedDevice.address, media));
-        setNowPlaying(media);
+        const sig = await castToSignage(selectedDevice.address, item);
+        if (stale()) return 'superseded';
+        setSignage(sig);
+        setNowPlaying(item);
         setStatus('IDLE');
+        return 'ok';
       } catch (e) {
+        if (stale()) return 'superseded';
         setError(errMessage(e));
+        return 'failed';
       } finally {
-        setBusy(false);
+        if (!stale()) setBusy(false);
       }
-      return;
     }
 
-    // The item we actually cast — swapped for an on-device-converted copy below if
-    // the picked video is a codec the TV can't play (and small enough to re-encode).
-    let item = media;
+    // `item` is what we actually cast — already swapped for an on-device-converted
+    // copy (via convertSelected) when the picked video was a codec the TV can't play.
     let usingRemux = false;
     let servedFromPhone = false;
     let durationSec = 0;
+    // Live on-the-fly transcode of a local file the TV can't play (play-while-transcoding).
+    const liveTranscode = castOpts.liveTranscode === true && ffmpegAvailable && item.isLocal;
 
+    console.log(
+      `[cast] begin: name="${item.name}" kind=${item.kind} isLocal=${item.isLocal} live=${item.live === true} liveTranscode=${liveTranscode} device="${selectedDevice.friendlyName}"`,
+    );
     try {
       // Probe local media up front: the duration feeds a seekable DLNA timeline
       // (Samsung 701s on Seek without it), and for video the codec/resolution lets
       // us catch files the TV can't play BEFORE copying gigabytes to serve them.
+      let probe: Awaited<ReturnType<typeof probeMedia>> | undefined;
       if (item.isLocal && ffmpegAvailable) {
-        let probe: Awaited<ReturnType<typeof probeMedia>> | undefined;
         try {
           probe = await probeMedia(item.uri);
-        } catch {
-          /* probe is best-effort */
+        } catch (e) {
+          console.log(`[cast] probe failed (best-effort): ${errMessage(e)}`);
         }
+        if (stale()) return 'superseded';
         if (probe) {
+          console.log(
+            `[cast] probe: container=${probe.container} vcodec=${probe.videoCodec} acodec=${probe.audioCodec} ${probe.width}x${probe.height} ${probe.fps ?? '?'}fps dur=${Math.round(probe.durationSec)}s`,
+          );
           durationSec = probe.durationSec;
-          if (item.kind === 'video' && assessForCast(probe).videoPlan === 'reencode') {
-            // The TV can't play this codec as-is (e.g. HEVC). We don't silently start
-            // a (potentially very long) transcode from a Cast tap — instead point the
-            // user at the explicit "1080p" button, and offer the raw-URL fallback.
-            setError('Your TV can’t play this video as-is. Tap “1080p” to convert it first, or use Stream via URL.');
+          // The TV can't play this codec as-is (e.g. HEVC). Unless the caller explicitly
+          // chose play-while-transcoding, don't silently start a (potentially very long)
+          // transcode from a Cast tap.
+          if (!liveTranscode && item.kind === 'video' && assessForCast(probe).videoPlan === 'reencode') {
+            if (castOpts.fromQueue) {
+              // The single-selection fallback UI (Play now / Stream via URL) works on
+              // `media`, which a queue item is not — offering it here would render
+              // dead-end buttons. Fail plainly; the queue tears down with the error.
+              setError(
+                `“${item.name}” can’t play on this TV as-is — Convert it first, then re-add it to the queue.`,
+              );
+              return 'failed';
+            }
+            // Single-selection cast: offer the choice (Play now / Convert / Stream via URL).
+            setError(
+              'Your TV can’t play this video as-is. Use “Play now” to watch it while it converts, “Convert” to save a playable copy, or Stream via URL.',
+            );
             setCanStreamViaUrl(true);
-            return;
+            return 'failed';
           }
         }
       }
 
-      // A live HLS stream can't be pushed to most DLNA TVs as-is. When FFmpeg is
-      // present (Android) we remux it on-device into a continuous MPEG-TS feed the
-      // TV can play; otherwise we hand the TV the HLS URL directly (works on sets
-      // with native HLS). Computed AFTER any convert (a converted file is a plain MP4).
-      usingRemux = item.live === true && ffmpegAvailable;
+      // A live HLS stream (or a play-while-transcode of a local file) is served to the
+      // TV as a continuous MPEG-TS feed rather than a seekable file. Computed AFTER any
+      // convert (a converted file is a plain MP4).
+      usingRemux = (item.live === true && ffmpegAvailable) || liveTranscode;
       servedFromPhone = item.isLocal || usingRemux;
 
       // A prior cast may have left a live remux running; tear it down unless we're
@@ -608,11 +782,28 @@ export function useCast(): UseCast {
         });
       }
 
-      // The MIME we advertise to the TV: for a remux it's the MPEG-TS feed we now
-      // serve, not the original playlist's `application/vnd.apple.mpegurl`.
+      // The MIME we advertise to the TV: for a remux/transcode it's the MPEG-TS feed we
+      // now serve, not the source's own MIME.
       let castMime = item.mime;
       let url: string;
-      if (item.isLocal) {
+      if (liveTranscode) {
+        // Downscale to the chosen preset's target when the source is larger.
+        const preset = CONVERT_QUALITY_TUNING[convertQuality];
+        const w = probe?.width ?? 0;
+        const h = probe?.height ?? 0;
+        const needScale = h > preset.maxHeight || w > preset.maxWidth;
+        console.log(
+          `[cast] starting live transcode: scaleTo=${needScale ? `${preset.maxWidth}x${preset.maxHeight}` : 'none'} bitrate=${preset.bitRateMbps}M fps=${probe?.fps ?? '?'}`,
+        );
+        url = await serveTranscodedFile(item.uri, {
+          scaleTo: needScale ? { w: preset.maxWidth, h: preset.maxHeight } : undefined,
+          bitRateMbps: preset.bitRateMbps,
+          hwDecode: true,
+          fps: probe?.fps,
+        });
+        console.log(`[cast] live transcode serving at ${url}`);
+        castMime = 'video/mp2t';
+      } else if (item.isLocal) {
         url = await shareLocalFile(item.uri, item.name, {
           mime: item.mime,
           kind: item.kind,
@@ -626,13 +817,19 @@ export function useCast(): UseCast {
       } else {
         url = item.uri;
       }
+      // A newer cast (or Stop) superseded us while serving — it now owns the served
+      // slot and the TV; committing anything (or casting) would corrupt its state.
+      if (stale()) return 'superseded';
       lastServedUrlRef.current = url; // for the byte-seek fallback
+
+      // A play-while-transcode feed is a live, non-seekable stream just like an HLS remux.
+      const asLive = item.live === true || liveTranscode;
 
       console.log('[DLNA] casting', {
         url,
         mime: castMime,
         kind: item.kind,
-        live: item.live === true,
+        live: asLive,
         remux: usingRemux,
         device: selectedDevice.friendlyName,
         control: selectedDevice.avTransportControlURL,
@@ -665,6 +862,7 @@ export function useCast(): UseCast {
               `(${errMessage(e)}). Casting can't continue.`,
           );
         }
+        console.log(`[cast] reachability HEAD ${url} → ${probeStatus}`);
         if (probeStatus < 200 || probeStatus >= 400) {
           throw new Error(
             `The phone's media server returned ${probeStatus} for the file. ` +
@@ -672,30 +870,40 @@ export function useCast(): UseCast {
           );
         }
       }
+      // Last checkpoint before involving the TV: a superseded cast must not push a
+      // stale SetAVTransportURI after (or racing) the newer one's.
+      if (stale()) return 'superseded';
 
+      console.log(`[cast] SetAVTransportURI+Play → ${selectedDevice.avTransportControlURL}`);
       await castMedia(selectedDevice, {
         url,
         title: item.name,
         kind: item.kind,
         mime: castMime,
         size: item.size,
-        durationSec: durationSec || undefined,
+        // A live feed advertises no seekable timeline.
+        durationSec: asLive ? undefined : durationSec || undefined,
         subtitleUrl: subtitleUrlRef.current ?? undefined,
-        live: item.live === true,
+        live: asLive,
       });
+      if (stale()) return 'superseded'; // superseded during the SOAP round-trip
+      console.log('[cast] SetAVTransportURI+Play OK — starting poll');
       setNowPlaying(item);
       setStatus('PLAYING');
       setPosition(0);
       setDuration(0);
       // A live stream has no timeline to scrub, so don't offer seek for it.
       setSeekSupported(
-        !item.live && !seekUnsupportedDevices.has(selectedDevice.id),
+        !asLive && !seekUnsupportedDevices.has(selectedDevice.id),
       );
       startPolling(selectedDevice);
       // Photos have no volume; only sync it for audio/video.
       if (item.kind !== 'image') refreshVolume(selectedDevice);
+      return 'ok';
     } catch (e) {
+      if (stale()) return 'superseded'; // newer cast owns the state; stay silent
       const msg = errMessage(e);
+      console.log(`[cast] ERROR: ${msg}`);
       // A live remux that never reached playback is just burning CPU — stop it.
       if (usingRemux) stopLiveStream().catch(() => {});
       // DLNA push rejected (UPnP 402) — the device may be signage we didn't
@@ -705,20 +913,248 @@ export function useCast(): UseCast {
           setSignage(await castToSignage(selectedDevice.address, item));
           setNowPlaying(item);
           setStatus('IDLE');
-          return;
+          return 'ok';
         } catch (e2) {
           setError(
             `DLNA push was rejected and the signage fallback failed: ${errMessage(e2)}`,
           );
-          return;
+          return 'failed';
         }
       }
       setError(msg);
+      return 'failed';
     } finally {
-      setBusy(false);
-      setCastProgress(null);
+      // A superseded run must not clear the busy/progress the newer run just set.
+      if (!stale()) {
+        setBusy(false);
+        setCastProgress(null);
+      }
     }
-  }, [selectedDevice, media, startPolling]);
+    },
+    [selectedDevice, startPolling, convertQuality],
+  );
+
+  // ---- Playlist navigation ----
+  // All queue mutations go through applyQueue so the ref mirror and the play order
+  // stay in lockstep with the rendered state. Rebuilding the order on membership
+  // change reshuffles when shuffle is on (fine — you just changed the queue), but the
+  // currently-playing item is anchored to the front so advance() still visits every
+  // other item (an unanchored fresh permutation skips whatever lands before it).
+  const applyQueue = useCallback((next: MediaItem[]) => {
+    queueRef.current = next;
+    setQueue(next);
+    let order = makeOrder(next.length, shuffleRef.current);
+    const cur = queueIndexRef.current;
+    if (cur >= 0 && cur < next.length) order = anchorOrder(order, cur);
+    orderRef.current = order;
+  }, []);
+
+  // Play queue[idx] now. Queue items don't carry the standalone subtitle (it was
+  // matched to one picked file), so clear it rather than push the wrong captions.
+  // If the cast FAILS (not merely superseded by a newer action), tear down — leaving
+  // the previous track's "PLAYING" state up with polling stopped would freeze the
+  // Now-Playing sheet and keep-alive notification forever.
+  const playQueueIndex = useCallback(
+    (idx: number) => {
+      const item = queueRef.current[idx];
+      if (!item) return;
+      queueIndexRef.current = idx;
+      setQueueIndex(idx);
+      playingFromQueueRef.current = true;
+      if (subtitleUrlRef.current) {
+        subtitleUrlRef.current = null;
+        setSubtitle(null);
+        clearServedSubtitle();
+      }
+      void castItem(item, { fromQueue: true }).then((outcome) => {
+        if (outcome === 'failed') {
+          console.log('[cast] queue item failed to start — tearing down');
+          teardownPlayback();
+        }
+      });
+    },
+    [castItem, teardownPlayback],
+  );
+
+  // Advance to the next item (auto on end-of-media, or manual via Next). Returns
+  // false when there's nowhere to go (end of queue, repeat off) so finishPlayback
+  // can fall through to a real teardown.
+  const castNext = useCallback(
+    (manual: boolean): boolean => {
+      const q = queueRef.current;
+      if (q.length === 0) return false;
+      const idx = advance(
+        { length: q.length, current: queueIndexRef.current, order: orderRef.current, repeat: repeatRef.current },
+        manual,
+      );
+      if (idx == null || !q[idx]) return false;
+      playQueueIndex(idx);
+      return true;
+    },
+    [playQueueIndex],
+  );
+  castNextRef.current = castNext;
+
+  const next = useCallback(() => {
+    castNext(true);
+  }, [castNext]);
+
+  const previous = useCallback(() => {
+    const q = queueRef.current;
+    if (q.length === 0) return;
+    const idx = retreat({
+      length: q.length,
+      current: queueIndexRef.current,
+      order: orderRef.current,
+      repeat: repeatRef.current,
+    });
+    if (idx != null) playQueueIndex(idx);
+  }, [playQueueIndex]);
+
+  const playQueueAt = useCallback(
+    (index: number) => {
+      playQueueIndex(index);
+    },
+    [playQueueIndex],
+  );
+
+  const enqueue = useCallback(() => {
+    if (!media) return;
+    applyQueue([...queueRef.current, media]);
+    clearMedia(); // clear the pending selection (and its subtitle) — it's queued now
+  }, [media, applyQueue, clearMedia]);
+
+  // Smart "Add files": pick one or many. A single file becomes the working selection
+  // (so Convert / Subs / a one-off Cast apply to it); several go straight to the queue.
+  const addMedia = useCallback(async () => {
+    setError(null);
+    setStreamUrl(null);
+    setCanStreamViaUrl(false);
+    // The OS picker copies the chosen file into our cache before resolving; for a
+    // multi-GB file that takes a while (native, so the UI stays responsive — show a
+    // spinner so it doesn't look dead).
+    setImporting(true);
+    try {
+      const items = await pickMediaFiles();
+      if (items.length === 1) {
+        setMedia(items[0]);
+        clearSubtitle();
+      } else if (items.length > 1) {
+        applyQueue([...queueRef.current, ...items]);
+      }
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setImporting(false);
+    }
+  }, [applyQueue, clearSubtitle]);
+
+  // Pick a folder and append every media file inside it to the queue.
+  const addFolder = useCallback(async () => {
+    setError(null);
+    setImporting(true);
+    try {
+      const items = await pickFolderMedia();
+      // null = the user cancelled the folder picker (say nothing); [] = they picked a
+      // folder with no playable media (tell them why nothing was added).
+      if (items === null) return;
+      if (items.length) applyQueue([...queueRef.current, ...items]);
+      else setError('No playable video, audio, or images found directly in that folder.');
+    } catch (e) {
+      setError(errMessage(e));
+    } finally {
+      setImporting(false);
+    }
+  }, [applyQueue]);
+
+  const removeFromQueue = useCallback(
+    (index: number) => {
+      const q = queueRef.current;
+      if (index < 0 || index >= q.length) return;
+      const nextQueue = q.filter((_, i) => i !== index);
+      const newIdx = indexAfterRemoval(queueIndexRef.current, index, nextQueue.length);
+      queueIndexRef.current = newIdx;
+      setQueueIndex(newIdx);
+      applyQueue(nextQueue);
+    },
+    [applyQueue],
+  );
+
+  const clearQueue = useCallback(() => {
+    queueIndexRef.current = -1;
+    setQueueIndex(-1);
+    applyQueue([]);
+  }, [applyQueue]);
+
+  const toggleShuffle = useCallback(() => {
+    setShuffle((s) => {
+      const nextShuffle = !s;
+      shuffleRef.current = nextShuffle;
+      let order = makeOrder(queueRef.current.length, nextShuffle);
+      // Keep the currently-playing item at the front of the (re)built order so
+      // advance() continues from it and still visits every other item — an
+      // unanchored fresh permutation would skip whatever landed before it.
+      const cur = queueIndexRef.current;
+      if (cur >= 0 && cur < queueRef.current.length) order = anchorOrder(order, cur);
+      orderRef.current = order;
+      return nextShuffle;
+    });
+  }, []);
+
+  const cycleRepeat = useCallback(() => {
+    setRepeatMode((r) => {
+      const nextMode: RepeatMode = r === 'off' ? 'all' : r === 'all' ? 'one' : 'off';
+      repeatRef.current = nextMode;
+      return nextMode;
+    });
+  }, []);
+
+  // Start the queue from its first (possibly shuffled) slot.
+  const startQueue = useCallback(() => {
+    const q = queueRef.current;
+    if (q.length === 0) return;
+    orderRef.current = makeOrder(q.length, shuffleRef.current);
+    playQueueIndex(orderRef.current[0] ?? 0);
+  }, [playQueueIndex]);
+
+  // The primary Cast action: play the built queue if there is one, else cast the
+  // single current selection (the classic one-shot flow, with an empty queue).
+  const cast = useCallback(async () => {
+    if (!selectedDevice) {
+      setError('Pick a TV / device first.');
+      return;
+    }
+    if (queueRef.current.length > 0) {
+      startQueue();
+      return;
+    }
+    if (!media) {
+      setError('Choose a file or enter a URL first.');
+      return;
+    }
+    // A one-off cast, not from the queue: end-of-media must tear down, not advance
+    // a parked queue.
+    playingFromQueueRef.current = false;
+    queueIndexRef.current = -1;
+    setQueueIndex(-1);
+    await castItem(media);
+  }, [selectedDevice, media, startQueue, castItem]);
+
+  // Play the selected local video now by transcoding it on the fly (HEVC → H.264)
+  // and streaming it as a live feed — playback starts in seconds instead of waiting
+  // for a full up-front convert. No scrubbing (it's a live stream); for a seekable
+  // copy the user runs Convert instead.
+  const playNow = useCallback(async () => {
+    if (!media) {
+      setError('Choose a file first.');
+      return;
+    }
+    console.log('[cast] playNow tapped (live transcode)');
+    playingFromQueueRef.current = false;
+    queueIndexRef.current = -1;
+    setQueueIndex(-1);
+    await castItem(media, { liveTranscode: true });
+  }, [media, castItem]);
 
   // Fallback for a file the TV can't DLNA-cast: serve it over HTTP and expose the
   // URL so the user can open it in a browser / player on any device on the Wi-Fi.
@@ -786,15 +1222,12 @@ export function useCast(): UseCast {
     () =>
       runAction(async (d) => {
         await stop(d);
-        setStatus('IDLE'); // back to idle so the Now-Playing sheet hides
-        setPosition(0);
-        setNowPlaying(null);
-        stopPolling();
-        // Stop the on-device remux (if this was a live stream) so FFmpeg isn't
-        // left running after the TV has stopped.
-        stopLiveStream().catch(() => {});
+        // Full teardown: stops the poll, bumps the cast sequence (so an in-flight
+        // auto-advance from the queue aborts instead of restarting playback), clears
+        // the queue cursor and Now-Playing, and stops any on-device remux/transcode.
+        teardownPlayback();
       }),
-    [runAction, stopPolling],
+    [runAction, teardownPlayback],
   );
 
   const onSeek = useCallback(
@@ -1137,10 +1570,10 @@ export function useCast(): UseCast {
     },
     scan,
     selectDevice,
-    chooseFile,
     chooseUrl,
     clearMedia,
     cast,
+    playNow,
     onPlay,
     onPause,
     onStop,
@@ -1155,8 +1588,25 @@ export function useCast(): UseCast {
     canConvert: ffmpegAvailable,
     converting,
     convertProgress,
+    convertEtaSec,
     convertSelected,
     cancelConversion,
+    convertQuality,
+    setConvertQuality,
+    queue,
+    queueIndex,
+    shuffle,
+    repeatMode,
+    enqueue,
+    addMedia,
+    addFolder,
+    removeFromQueue,
+    clearQueue,
+    playQueueAt,
+    next,
+    previous,
+    toggleShuffle,
+    cycleRepeat,
     subdlKey,
     setSubdlKey,
     subResults,

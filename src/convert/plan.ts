@@ -11,6 +11,9 @@ export interface MediaProbe {
   /** Video width/height in px (0/undefined if unknown). Used to gate re-encode. */
   width?: number;
   height?: number;
+  /** Source frame rate (0/undefined if unknown). Gates a source-aware fps cap so we
+   *  never up-sample a 24fps source to 30 (which would ADD frames = slower). */
+  fps?: number;
 }
 
 export interface CastAssessment {
@@ -26,10 +29,13 @@ export interface CastAssessment {
   reason: string;
 }
 
-// Above this the source is downscaled to 1080p during re-encode — the Freestyle is
-// a 1080p device and a phone software-encode of 4K is punishingly slow.
-const MAX_HEIGHT = 1088; // 1080 + slack
-const MAX_WIDTH = 1940; // 1920 + slack
+// The TV ceiling: above this the source must be downscaled during a re-encode — the
+// Freestyle is a 1080p device and a phone encode of 4K is punishingly slow. Exported
+// so convertForCast can tell "exceeds what the TV can show" (forces a re-encode even
+// of H.264) apart from "merely exceeds the chosen preset's box" (which must NOT turn
+// a fast lossless remux into a slow lossy re-encode).
+export const MAX_HEIGHT = 1088; // 1080 + slack
+export const MAX_WIDTH = 1940; // 1920 + slack
 
 /** A short human label for a resolution, used in the "can't convert" guidance. */
 function resolutionLabel(width: number, height: number): string {
@@ -95,26 +101,6 @@ export function assessForCast(p: MediaProbe): CastAssessment {
 }
 
 /**
- * Plan for the explicit "1080p" action: guarantee a ≤1080p H.264 MP4. Re-encodes
- * (downscaling if the source is larger) unless the file is already H.264 within
- * 1080p, in which case the normal plan (a fast remux) is enough.
- */
-export function plan1080p(p: MediaProbe): CastAssessment {
-  const over1080 = (p.height ?? 0) > MAX_HEIGHT || (p.width ?? 0) > MAX_WIDTH;
-  const isH264 = p.videoCodec === 'h264' || p.videoCodec === null;
-  if (isH264 && !over1080) return assessForCast(p);
-  const audioOk = p.audioCodec === 'aac' || p.audioCodec === 'mp3' || p.audioCodec === null;
-  return {
-    compatible: false,
-    canConvert: true,
-    videoPlan: 'reencode',
-    audioPlan: p.audioCodec === null ? 'none' : audioOk ? 'copy' : 'aac',
-    downscale: over1080,
-    reason: `Convert to 1080p H.264${over1080 ? ` (from ${resolutionLabel(p.width ?? 0, p.height ?? 0)})` : ''}.`,
-  };
-}
-
-/**
  * Build the FFmpeg argument list for a conversion. Video is copied when already H.264
  * (fast, lossless remux) or re-encoded to H.264 otherwise, with a downscale-to-1080p
  * filter when the source is larger. `hw` selects the Android MediaCodec hardware
@@ -129,11 +115,30 @@ export interface EncodeOpts {
   hwEncode?: boolean;
 }
 
+/**
+ * Speed/quality knobs from the user's chosen convert preset (see convert/quality.ts).
+ * Both shrink the encoder's workload: capping the frame rate drops frames (big win on
+ * 60fps sources), and a lower bitrate produces fewer bytes (and a smaller file).
+ */
+export interface ConvertTuning {
+  /** Cap the output frame rate (drop frames above this). 0/undefined = keep source.
+   *  The CALLER must pass a source-aware value (only set when source fps > target),
+   *  because FFmpeg's `-r` up-samples — adding frames — when the source is slower. */
+  maxFps?: number;
+  /** Target video bitrate (megabits/s) for the hardware encoder. Default 8. */
+  bitRateMbps?: number;
+  /** Downscale target (px). When set, overrides the default 1080p downscale — used to
+   *  drop to 720p for the "fastest" preset. Only apply when the source is larger; the
+   *  caller decides that (buildConvertArgs just emits the filter). */
+  scaleTo?: { w: number; h: number };
+}
+
 export function buildConvertArgs(
   input: string,
   outPath: string,
   plan: CastAssessment,
   enc: EncodeOpts = {},
+  tuning: ConvertTuning = {},
 ): string[] {
   const reencode = plan.videoPlan === 'reencode';
   const args = ['-y'];
@@ -143,18 +148,23 @@ export function buildConvertArgs(
   if (reencode && enc.hwDecode) args.push('-hwaccel', 'mediacodec');
   args.push('-i', input);
   if (reencode) {
-    // Fit within 1920x1080, preserve aspect, keep dimensions even (H.264 requires it).
+    // Fit within the target box, preserve aspect, keep dimensions even (H.264 requires
+    // it). `scaleTo` (from the preset, e.g. 720p for "fastest") overrides the default
+    // 1080p downscale; otherwise fall back to plan.downscale's 1920x1080 for 4K sources.
     // (Default scaler: measured no throughput gain from fast_bilinear — the ceiling is
     // the hardware decode↔encode frame copy, not the scale — so keep the better quality.)
     const vf: string[] = [];
-    if (plan.downscale) {
-      vf.push('scale=w=1920:h=1080:force_original_aspect_ratio=decrease:force_divisible_by=2');
+    const scale = tuning.scaleTo ?? (plan.downscale ? { w: 1920, h: 1080 } : null);
+    if (scale) {
+      vf.push(
+        `scale=w=${scale.w}:h=${scale.h}:force_original_aspect_ratio=decrease:force_divisible_by=2`,
+      );
     }
     if (enc.hwEncode) {
       // Hardware encoder: format=nv12 downconverts 10-bit HDR → 8-bit and gives the
       // encoder the pixel format it expects. HW encoders are bitrate-based (no CRF).
       vf.push('format=nv12');
-      args.push('-c:v', 'h264_mediacodec', '-b:v', '8M');
+      args.push('-c:v', 'h264_mediacodec', '-b:v', `${tuning.bitRateMbps ?? 8}M`);
     } else {
       // Software x264 fallback — slow but works on any device.
       vf.push('format=yuv420p');
@@ -167,6 +177,10 @@ export function buildConvertArgs(
   if (plan.audioPlan === 'aac') args.push('-c:a', 'aac', '-b:a', '192k');
   else if (plan.audioPlan === 'none') args.push('-an');
   else args.push('-c:a', 'copy');
+  // Cap the output frame rate (drops frames above `maxFps`) when the preset asks for
+  // it — the single biggest speed win on 60fps/HFR sources. A remux (video copy) has
+  // no frames to drop, so only apply it to a re-encode.
+  if (reencode && tuning.maxFps && tuning.maxFps > 0) args.push('-r', String(tuning.maxFps));
   args.push('-movflags', '+faststart', outPath);
   return args;
 }

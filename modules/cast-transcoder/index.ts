@@ -12,6 +12,10 @@ export interface NativeTranscodeOptions {
   /** Max output dimensions (aspect kept, downscale-only). Defaults to 1080p. */
   maxHeight?: number;
   maxWidth?: number;
+  /** Cap the output frame rate (0 = keep source). From the convert-quality preset. */
+  maxFps?: number;
+  /** Encoder target bitrate in bits/s. From the convert-quality preset. Default 8 Mbps. */
+  bitRate?: number;
   onProgress?: (fraction: number) => void;
 }
 
@@ -31,6 +35,8 @@ export async function transcodeToH264(opts: NativeTranscodeOptions): Promise<str
       opts.outputPath,
       opts.maxHeight ?? 1080,
       opts.maxWidth ?? 1920,
+      opts.maxFps ?? 0,
+      opts.bitRate ?? 8_000_000,
     );
   } catch (e) {
     if ((e as { code?: string })?.code === 'ERR_CANCELLED') {
