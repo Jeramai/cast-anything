@@ -150,6 +150,12 @@ export interface UseCast {
   /** False once the selected device has refused every seek mode (e.g. Samsung
    * "The Freestyle" — it advertises Seek but its renderer won't honor it). */
   seekSupported: boolean;
+  /** True while what's playing is a live feed (on-the-fly transcode or HLS remux) —
+   *  it streams and can't be scrubbed. Drives the "Streaming" note in the sheet. */
+  isLive: boolean;
+  /** The source file's real duration (seconds; 0 if unknown). Shown as the end time /
+   *  progress even for a live transcode, whose transport reports duration 0. */
+  knownDurationSec: number;
   /** Last known device volume (0–100), or null if not read / unsupported. */
   volume: number | null;
   busy: boolean;
@@ -162,9 +168,6 @@ export interface UseCast {
   chooseUrl: (url: string) => void;
   clearMedia: () => void;
   cast: () => Promise<void>;
-  /** Play the selected local video now by transcoding it on the fly (starts in
-   *  seconds; no seeking). The instant alternative to a full up-front Convert. */
-  playNow: () => Promise<void>;
   onPlay: () => Promise<void>;
   onPause: () => Promise<void>;
   onStop: () => Promise<void>;
@@ -298,6 +301,13 @@ export function useCast(): UseCast {
   // `streamUrl` holds the served URL once they opt in.
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
   const [canStreamViaUrl, setCanStreamViaUrl] = useState(false);
+  // True while what's on the TV is a LIVE feed (an on-the-fly transcode or an HLS
+  // remux) rather than a seekable file — drives the "Streaming · can't seek" note.
+  const [isLive, setIsLive] = useState(false);
+  // The source file's real duration from the probe (seconds; 0 if unknown). A live
+  // feed advertises no timeline, so the TV reports duration 0 — but for a transcode
+  // we know the length and can still SHOW it (read-only) as the end time / progress.
+  const [knownDurationSec, setKnownDurationSec] = useState(0);
   // Bumped on each successful seek so the playback notification re-syncs its
   // timeline (we otherwise let the MediaSession extrapolate, ignoring polls).
   const [seekNonce, setSeekNonce] = useState(0);
@@ -398,6 +408,8 @@ export function useCast(): UseCast {
     setStatus('IDLE');
     setPosition(0);
     setNowPlaying(null);
+    setIsLive(false);
+    setKnownDurationSec(0);
     setBusy(false); // an aborted in-flight cast skips its own busy-reset
     setCastProgress(null);
     stopLiveStream().catch(() => {});
@@ -794,11 +806,17 @@ export function useCast(): UseCast {
               // stopping the whole queue.
               console.log(`[cast] queue item can't be transcoded here — skipping: ${item.name}`);
               return 'skip';
+            } else if (canLiveTranscode) {
+              // Single-selection cast: just transcode it on the fly (starts in seconds)
+              // — no up-front choice. "Convert" (on the media card) is still there for a
+              // seekable saved copy; Stream-via-URL appears only if this transcode can't
+              // start (see the serve failure below).
+              console.log(`[cast] selection needs re-encode — auto live-transcoding: ${item.name}`);
+              liveTranscode = true;
             } else {
-              // Single-selection cast: offer the choice (Play now / Convert / Stream via URL).
-              setError(
-                'Your TV can’t play this video as-is. Use “Play now” to watch it while it converts, “Convert” to save a playable copy, or Stream via URL.',
-              );
+              // No on-device transcode available (no FFmpeg / not local) → offer the
+              // network fallback so the file can at least play on another device.
+              setError('Your TV can’t play this video as-is. Try “Convert”, or Stream via URL.');
               setCanStreamViaUrl(true);
               return 'failed';
             }
@@ -860,12 +878,18 @@ export function useCast(): UseCast {
         } catch (e) {
           if (stale()) return 'superseded';
           // The transcode couldn't start (no MediaCodec pipeline accepted this file).
-          // From the queue: skip + grey it out. Single selection: surface the error.
+          // From the queue: skip + grey it out. Single selection: fall back to the
+          // network-stream escape hatch so the file can still play elsewhere.
           if (castOpts.fromQueue) {
-            console.log(`[cast] transcode failed to start — skipping queue item: ${item.name}`);
+            console.log(`[cast] transcode failed to start (${errMessage(e)}) — skipping queue item: ${item.name}`);
             return 'skip';
           }
-          throw e;
+          console.log(`[cast] transcode failed to start (${errMessage(e)}) — offering Stream via URL: ${item.name}`);
+          setError(
+            'Couldn’t transcode this file for your TV. Use “Convert” for a saved copy, or Stream it via URL to play on another device.',
+          );
+          setCanStreamViaUrl(true);
+          return 'failed';
         }
         console.log(`[cast] live transcode serving at ${url}`);
         castMime = 'video/mp2t';
@@ -955,6 +979,8 @@ export function useCast(): UseCast {
       if (stale()) return 'superseded'; // superseded during the SOAP round-trip
       console.log('[cast] SetAVTransportURI+Play OK — starting poll');
       setNowPlaying(item);
+      setIsLive(asLive); // drives the "Streaming · can't seek" note in the sheet
+      setKnownDurationSec(durationSec); // real length even when the live feed reports 0
       setStatus('PLAYING');
       setPosition(0);
       setDuration(0);
@@ -1225,22 +1251,6 @@ export function useCast(): UseCast {
     setQueueIndex(-1);
     await castItem(media);
   }, [selectedDevice, media, startQueue, castItem]);
-
-  // Play the selected local video now by transcoding it on the fly (HEVC → H.264)
-  // and streaming it as a live feed — playback starts in seconds instead of waiting
-  // for a full up-front convert. No scrubbing (it's a live stream); for a seekable
-  // copy the user runs Convert instead.
-  const playNow = useCallback(async () => {
-    if (!media) {
-      setError('Choose a file first.');
-      return;
-    }
-    console.log('[cast] playNow tapped (live transcode)');
-    playingFromQueueRef.current = false;
-    queueIndexRef.current = -1;
-    setQueueIndex(-1);
-    await castItem(media, { liveTranscode: true });
-  }, [media, castItem]);
 
   // Fallback for a file the TV can't DLNA-cast: serve it over HTTP and expose the
   // URL so the user can open it in a browser / player on any device on the Wi-Fi.
@@ -1639,6 +1649,8 @@ export function useCast(): UseCast {
     position,
     duration,
     seekSupported,
+    isLive,
+    knownDurationSec,
     volume,
     busy,
     error,
@@ -1659,7 +1671,6 @@ export function useCast(): UseCast {
     chooseUrl,
     clearMedia,
     cast,
-    playNow,
     onPlay,
     onPause,
     onStop,

@@ -312,7 +312,11 @@ function NowPlayingSheet({
               {cast.nowPlaying?.name ?? "Media"}
             </Text>
             <Text style={styles.statusLabel}>
-              {(isImage ? "ON SCREEN" : cast.status.replace(/_/g, " "))}
+              {isImage
+                ? "ON SCREEN"
+                : cast.isLive
+                  ? `${cast.status.replace(/_/g, " ")} · STREAMING`
+                  : cast.status.replace(/_/g, " ")}
             </Text>
           </View>
           {!isImage && (
@@ -363,7 +367,10 @@ function NowPlayingSheet({
             <View style={styles.timeRow}>
               <Text style={styles.timeText}>{formatTime(cast.position)}</Text>
               <Text style={styles.timeText}>
-                {cast.duration > 0 ? formatTime(cast.duration) : "--:--"}
+                {(() => {
+                  const total = cast.duration > 0 ? cast.duration : cast.knownDurationSec;
+                  return total > 0 ? formatTime(total) : "--:--";
+                })()}
               </Text>
             </View>
 
@@ -407,10 +414,6 @@ function NowPlayingSheet({
                 <Button icon="play-forward" title="15" onPress={() => cast.onSeek(cast.position + 15)} />
               )}
             </View>
-            {!cast.seekSupported && (
-              <Text style={styles.hint}>This device doesn’t support seeking.</Text>
-            )}
-
             <View style={styles.controls}>
               <Button icon="stop" title="Stop" variant="ghost" onPress={cast.onStop} style={styles.grow} />
               <Button icon="volume-low" onPress={() => cast.onVolumeStep(-1)} />
@@ -419,6 +422,17 @@ function NowPlayingSheet({
               </View>
               <Button icon="volume-high" onPress={() => cast.onVolumeStep(1)} />
             </View>
+            {/* Hints below all the controls */}
+            {cast.isLive ? (
+              <Text style={styles.hint}>
+                Streaming live as it transcodes — seeking isn’t available. Use “Convert”
+                for a seekable saved copy.
+              </Text>
+            ) : (
+              !cast.seekSupported && (
+                <Text style={styles.hint}>This device doesn’t support seeking.</Text>
+              )
+            )}
             {isPaused && <Text style={styles.hint}>Paused on the device.</Text>}
           </>
         )}
@@ -554,7 +568,11 @@ function CastScreen() {
   const isPaused = cast.status === "PAUSED_PLAYBACK";
   const isTransitioning = cast.status === "TRANSITIONING";
   const hasPlayback = cast.status !== "IDLE" && cast.status !== "NO_MEDIA_PRESENT";
-  const progress = cast.duration > 0 ? Math.min(1, cast.position / cast.duration) : 0;
+  // Prefer the transport's reported duration, but fall back to the probed length so a
+  // live transcode (which advertises no timeline → duration 0) still shows real
+  // progress and an end time.
+  const totalSec = cast.duration > 0 ? cast.duration : cast.knownDurationSec;
+  const progress = totalSec > 0 ? Math.min(1, cast.position / totalSec) : 0;
   // Photos aren't a timeline: no play/pause, seek, scrub or volume — just the
   // option to take them off the screen. Audio/video get the full transport.
   // Based on what's actually casting (nowPlaying), not the live selection.
@@ -781,23 +799,13 @@ function CastScreen() {
             ) : (
               <>
                 <Text style={styles.hint}>
-                  Your TV can’t play this file as-is. Play it now while the phone
-                  converts it (starts in seconds, no seeking) — or use “Convert” above for
-                  a seekable saved copy, or serve it to another player over the network.
+                  This TV can’t play this file, even by transcoding. Use “Convert” above
+                  for a seekable saved copy, or serve it to another player (like VLC) over
+                  the network:
                 </Text>
-                {cast.media?.isLocal && cast.media.kind === "video" && cast.canConvert && (
-                  <Button
-                    icon="play-circle"
-                    title="Play now (converts as it plays)"
-                    variant="primary"
-                    loading={cast.busy}
-                    onPress={cast.playNow}
-                    style={{ marginTop: 8 }}
-                  />
-                )}
                 <Button
                   icon="link-outline"
-                  title="Stream via URL instead"
+                  title="Stream via URL"
                   loading={cast.busy}
                   progress={cast.castProgress}
                   progressLabel="Serving"
