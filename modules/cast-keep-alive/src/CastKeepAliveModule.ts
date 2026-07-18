@@ -44,4 +44,5 @@ declare class CastKeepAliveModule extends NativeModule<CastKeepAliveEvents> {
 // `requireOptionalNativeModule` returns null when the native module isn't in the
 // running binary (e.g. before a rebuild that includes it), so importing this
 // never crashes an older build — callers just no-op until the app is rebuilt.
+// react-doctor-disable-next-line deslop/unused-export -- false positive: imported by ../index.ts (the module barrel) and used by every helper it exports
 export default requireOptionalNativeModule<CastKeepAliveModule>('CastKeepAlive');

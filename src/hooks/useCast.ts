@@ -1302,6 +1302,7 @@ export function useCast(): UseCast {
 
   const onPlay = useCallback(
     () =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         await play(d);
         setStatus('PLAYING');
@@ -1312,6 +1313,7 @@ export function useCast(): UseCast {
 
   const onPause = useCallback(
     () =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         await pause(d);
         setStatus('PAUSED_PLAYBACK');
@@ -1322,6 +1324,7 @@ export function useCast(): UseCast {
 
   const onStop = useCallback(
     () =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         await stop(d);
         // Full teardown: stops the poll, bumps the cast sequence (so an in-flight
@@ -1334,6 +1337,7 @@ export function useCast(): UseCast {
 
   const onSeek = useCallback(
     (seconds: number) =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         // Ignore a seek that arrives while another is still running (double-fired
         // taps, rapid scrubbing) — it would otherwise hit the renderer mid-jump.
@@ -1472,6 +1476,7 @@ export function useCast(): UseCast {
   // lurched the volume by ~40). `volumeRef` avoids re-reading on every press.
   const onVolumeStep = useCallback(
     (delta: number) =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         let base = volumeRef.current;
         if (base == null) base = (await getVolume(d)) ?? 50;
@@ -1487,6 +1492,7 @@ export function useCast(): UseCast {
   // relative nudge, so the on-phone volume slider and the TV stay in lock-step.
   const onVolumeSet = useCallback(
     (v: number) =>
+      // react-doctor-disable-next-line react-doctor/no-impure-state-updater -- false positive: runAction is an async worker (takes the selected DlnaDevice), not a setState updater
       runAction(async (d) => {
         const next = Math.max(0, Math.min(100, Math.round(v)));
         await setVolume(d, next);
