@@ -367,7 +367,10 @@ export function useCast(): UseCast {
     playingFromQueueRef.current = false;
     queueIndexRef.current = -1;
     setQueueIndex(-1);
-    setStatus('STOPPED'); // → castActive becomes false → keep-alive/notification torn down
+    // IDLE, not STOPPED: the notification's castActive gate ignores both, but the
+    // Now-Playing sheet's `hasPlayback` gate hides only on IDLE/NO_MEDIA_PRESENT — a
+    // STOPPED here left the sheet on-screen showing "STOPPED" after Stop/end-of-queue.
+    setStatus('IDLE');
     setPosition(0);
     setNowPlaying(null);
     setBusy(false); // an aborted in-flight cast skips its own busy-reset
