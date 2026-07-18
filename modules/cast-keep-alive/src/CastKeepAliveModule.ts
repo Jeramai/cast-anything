@@ -26,6 +26,14 @@ declare class CastKeepAliveModule extends NativeModule<CastKeepAliveEvents> {
   /** Tear down the foreground service / end the background task. */
   stop(): void;
   /**
+   * Resolve after `ms` milliseconds on a native timer thread. Unlike JS
+   * setTimeout — which React Native drives from the UI Choreographer and PAUSES
+   * whenever the activity pauses (screen off) — this keeps ticking as long as the
+   * process runs (the cast foreground service's wakelock keeps it honest), so
+   * playback-critical loops survive the user pocketing the phone.
+   */
+  sleep(ms: number): Promise<void>;
+  /**
    * Ask the OS to exempt the app from battery optimization (Android), so the media
    * server keeps serving with the screen off. Returns true if already exempt (no
    * dialog); otherwise opens the system prompt and returns false. No-op on iOS.

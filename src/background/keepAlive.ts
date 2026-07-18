@@ -1,5 +1,6 @@
 import {
   addTransportCommandListener,
+  backgroundSleep,
   presentPlayback,
   requestIgnoreBatteryOptimizations,
   stopPlayback,
@@ -7,7 +8,7 @@ import {
   type TransportAction,
 } from '../../modules/cast-keep-alive';
 
-export { addTransportCommandListener };
+export { addTransportCommandListener, backgroundSleep };
 export type { PlaybackInfo, TransportAction };
 
 // Prompt for the battery-optimization exemption at most once per session — the

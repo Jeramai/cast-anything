@@ -17,6 +17,7 @@ import {
 import { isUnreachableByLan, parseUrl } from '../dlna/url';
 import {
   addTransportCommandListener,
+  backgroundSleep,
   ensureBackgroundExemption,
   presentKeepAlive,
   stopKeepAlive,
@@ -39,7 +40,7 @@ import {
   probeMedia,
   extractThumbnail,
 } from '../convert/transcode';
-import { assessForCast } from '../convert/plan';
+import { assessForCast, MAX_HEIGHT, MAX_WIDTH } from '../convert/plan';
 import {
   CONVERT_QUALITY_TUNING,
   DEFAULT_CONVERT_QUALITY,
@@ -320,7 +321,11 @@ export function useCast(): UseCast {
 
   const discoveryRef = useRef<{ stop: () => void } | null>(null);
   const scanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Token identifying the active poll loop (not an interval id): the loop runs on
+  // backgroundSleep — JS intervals freeze when the screen goes off, which would kill
+  // end-of-media detection and queue auto-advance the moment the phone is pocketed.
+  // Replacing the token (or nulling it) makes the old loop exit at its next tick.
+  const pollRef = useRef<object | null>(null);
   // End-of-media detection state for the poll loop: the position seen on the
   // previous tick (to spot a frozen clock), and whether playback ever actually
   // started (so a spurious STOPPED *before* the first frame can't end the cast).
@@ -351,10 +356,7 @@ export function useCast(): UseCast {
   const castSeqRef = useRef(0);
 
   const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
+    pollRef.current = null; // the loop sees its token replaced and exits
   }, []);
 
   // Tear down all playback state: notification/keep-alive, the Now-Playing sheet,
@@ -397,70 +399,80 @@ export function useCast(): UseCast {
       stopPolling();
       prevPollPosRef.current = -1;
       playbackSeenRef.current = false;
-      pollRef.current = setInterval(async () => {
-        try {
-          const [transport, pos] = await Promise.all([
-            getTransportInfo(device),
-            getPositionInfo(device),
-          ]);
-          // If polling was stopped while this request was in flight (e.g. the user
-          // hit Stop), don't clobber the IDLE status the stop just set — otherwise
-          // the device's post-stop "STOPPED" reappears and the sheet pops back.
-          if (!pollRef.current) return;
-          const prevPos = prevPollPosRef.current;
-          // Whether the clock is advancing tells working (pos rising) from stalled
-          // (state PLAYING but pos frozen) at a glance in the log.
-          const advancing = pos.position !== prevPos;
-          console.log(
-            `[poll] state=${transport.state} pos=${pos.position} dur=${pos.duration} advancing=${advancing}`,
-          );
-          setStatus(transport.state);
-          setPosition(pos.position);
-          setDuration(pos.duration);
-
-          if (
-            transport.state === 'PLAYING' ||
-            transport.state === 'PAUSED_PLAYBACK' ||
-            transport.state === 'TRANSITIONING'
-          ) {
-            playbackSeenRef.current = true;
-          }
-
-          // End-of-media takes two shapes: the renderer reports a terminal
-          // transport state, OR it keeps saying PLAYING with the clock frozen at
-          // the very end (Samsung). Catch the latter via a non-advancing position
-          // within END_EPSILON_S of the duration. A genuine pause near the end
-          // isn't "ended", so the frozen-clock case is restricted to PLAYING.
-          const terminal =
-            transport.state === 'STOPPED' ||
-            transport.state === 'NO_MEDIA_PRESENT';
-          const frozenAtEnd =
-            transport.state === 'PLAYING' &&
-            pos.duration > 0 &&
-            pos.position >= pos.duration - END_EPSILON_S &&
-            pos.position === prevPos;
-          prevPollPosRef.current = pos.position;
-
-          if ((terminal || frozenAtEnd) && playbackSeenRef.current) {
-            // A STOPPED near the end of the timeline is the media finishing; a STOPPED
-            // far from it is the user pressing Stop on the TV's own remote — only the
-            // former may auto-advance the queue (else the TV can't stop a queue at
-            // all). With no known duration we can't tell, so we let it advance.
-            const dur = pos.duration > 0 ? pos.duration : durationRef.current;
-            const nearEnd =
-              dur <= 0 || pos.position >= dur - END_STOP_NEAR_S || prevPos >= dur - END_STOP_NEAR_S;
-            const endedNaturally = frozenAtEnd || (terminal && nearEnd);
+      // backgroundSleep-driven loop, NOT setInterval: RN freezes JS timers while the
+      // activity is paused (screen off), which silently stopped this poll — no
+      // end-of-media detection, no auto-advance, and a keep-alive notification frozen
+      // at the last on-screen position the moment the user pocketed the phone.
+      const token = {};
+      pollRef.current = token;
+      void (async () => {
+        while (pollRef.current === token) {
+          await backgroundSleep(POLL_MS);
+          if (pollRef.current !== token) return;
+          try {
+            const [transport, pos] = await Promise.all([
+              getTransportInfo(device),
+              getPositionInfo(device),
+            ]);
+            // If polling was stopped while this request was in flight (e.g. the user
+            // hit Stop), don't clobber the IDLE status the stop just set — otherwise
+            // the device's post-stop "STOPPED" reappears and the sheet pops back.
+            if (pollRef.current !== token) return;
+            const prevPos = prevPollPosRef.current;
+            // Whether the clock is advancing tells working (pos rising) from stalled
+            // (state PLAYING but pos frozen) at a glance in the log.
+            const advancing = pos.position !== prevPos;
             console.log(
-              `[poll] END detected (terminal=${terminal} frozenAtEnd=${frozenAtEnd} endedNaturally=${endedNaturally}) → finishPlayback`,
+              `[poll] state=${transport.state} pos=${pos.position} dur=${pos.duration} advancing=${advancing}`,
             );
-            finishPlayback(endedNaturally);
+            setStatus(transport.state);
+            setPosition(pos.position);
+            setDuration(pos.duration);
+
+            if (
+              transport.state === 'PLAYING' ||
+              transport.state === 'PAUSED_PLAYBACK' ||
+              transport.state === 'TRANSITIONING'
+            ) {
+              playbackSeenRef.current = true;
+            }
+
+            // End-of-media takes two shapes: the renderer reports a terminal
+            // transport state, OR it keeps saying PLAYING with the clock frozen at
+            // the very end (Samsung). Catch the latter via a non-advancing position
+            // within END_EPSILON_S of the duration. A genuine pause near the end
+            // isn't "ended", so the frozen-clock case is restricted to PLAYING.
+            const terminal =
+              transport.state === 'STOPPED' ||
+              transport.state === 'NO_MEDIA_PRESENT';
+            const frozenAtEnd =
+              transport.state === 'PLAYING' &&
+              pos.duration > 0 &&
+              pos.position >= pos.duration - END_EPSILON_S &&
+              pos.position === prevPos;
+            prevPollPosRef.current = pos.position;
+
+            if ((terminal || frozenAtEnd) && playbackSeenRef.current) {
+              // A STOPPED near the end of the timeline is the media finishing; a STOPPED
+              // far from it is the user pressing Stop on the TV's own remote — only the
+              // former may auto-advance the queue (else the TV can't stop a queue at
+              // all). With no known duration we can't tell, so we let it advance.
+              const dur = pos.duration > 0 ? pos.duration : durationRef.current;
+              const nearEnd =
+                dur <= 0 || pos.position >= dur - END_STOP_NEAR_S || prevPos >= dur - END_STOP_NEAR_S;
+              const endedNaturally = frozenAtEnd || (terminal && nearEnd);
+              console.log(
+                `[poll] END detected (terminal=${terminal} frozenAtEnd=${frozenAtEnd} endedNaturally=${endedNaturally}) → finishPlayback`,
+              );
+              finishPlayback(endedNaturally);
+            }
+          } catch (e) {
+            // Was swallowed as a "transient blip" — but a poll error can mean the TV
+            // dropped the control channel (its player crashed), so surface it.
+            console.log(`[poll] error: ${errMessage(e)}`);
           }
-        } catch (e) {
-          // Was swallowed as a "transient blip" — but a poll error can mean the TV
-          // dropped the control channel (its player crashed), so surface it.
-          console.log(`[poll] error: ${errMessage(e)}`);
         }
-      }, POLL_MS);
+      })();
     },
     [stopPolling, finishPlayback],
   );
@@ -787,13 +799,18 @@ export function useCast(): UseCast {
       let castMime = item.mime;
       let url: string;
       if (liveTranscode) {
-        // Downscale to the chosen preset's target when the source is larger.
+        // Only downscale when the TV itself can't show the source (>1080p) — a scale
+        // filter forces the CPU-copy pipeline, and an unscaled source can use the
+        // zero-copy hardware path instead, the only one that keeps up with the phone
+        // pocketed (screen-off caps the CPU clocks but not the codec silicon — see
+        // liveStream's pipeline notes). The >1080p case scales to the preset's box
+        // (speed matters most there) and remains screen-on-reliable only.
         const preset = CONVERT_QUALITY_TUNING[convertQuality];
         const w = probe?.width ?? 0;
         const h = probe?.height ?? 0;
-        const needScale = h > preset.maxHeight || w > preset.maxWidth;
+        const needScale = h > MAX_HEIGHT || w > MAX_WIDTH;
         console.log(
-          `[cast] starting live transcode: scaleTo=${needScale ? `${preset.maxWidth}x${preset.maxHeight}` : 'none'} bitrate=${preset.bitRateMbps}M fps=${probe?.fps ?? '?'}`,
+          `[cast] starting live transcode: scaleTo=${needScale ? `${preset.maxWidth}x${preset.maxHeight}` : 'none (zero-copy eligible)'} bitrate=${preset.bitRateMbps}M fps=${probe?.fps ?? '?'}`,
         );
         url = await serveTranscodedFile(item.uri, {
           scaleTo: needScale ? { w: preset.maxWidth, h: preset.maxHeight } : undefined,
@@ -1536,7 +1553,7 @@ export function useCast(): UseCast {
     return () => {
       discoveryRef.current?.stop();
       if (scanTimerRef.current) clearTimeout(scanTimerRef.current);
-      if (pollRef.current) clearInterval(pollRef.current);
+      pollRef.current = null; // ends the poll loop at its next tick
       stopKeepAlive();
     };
   }, []);

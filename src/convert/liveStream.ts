@@ -1,5 +1,6 @@
 import { CachesDirectoryPath, exists, mkdir, readDir, unlink } from '@dr.pogodin/react-native-fs';
 import { FFmpegKit, ReturnCode } from '@wokcito/ffmpeg-kit-react-native';
+import { backgroundSleep } from '../background/keepAlive';
 import { contentFeatures } from '../dlna/avtransport';
 import { pickReadySegment, pickStaleSegments } from '../server/dlnaHttp';
 import type { LiveSource } from '../server/mediaServer';
@@ -33,7 +34,6 @@ const STARTUP_TIMEOUT_MS = 20_000;
 // released yet. Retrying with a fresh input token after a short delay reliably succeeds
 // (this is what the user was doing by hand). Only the transcode path uses these.
 const FIRST_OUTPUT_TIMEOUT_MS = 7000;
-const TRANSCODE_START_ATTEMPTS = 4;
 const RETRY_DELAY_MS = 1200;
 // A healthy segment is well above this; a failed start leaves only a ~2KB stub.
 const MIN_HEALTHY_SEGMENT_BYTES = 50 * 1024;
@@ -47,7 +47,6 @@ const PRUNE_INTERVAL_MS = 5000;
 
 let sessionId: number | null = null;
 let running = false;
-let activePruneTimer: ReturnType<typeof setInterval> | null = null;
 // Monotonic session generation. The ffmpeg completion callback fires ASYNCHRONOUSLY —
 // for a superseded session it can land AFTER the replacement session has already
 // started, and must not clobber the new session's running/sessionId state (that left
@@ -55,7 +54,11 @@ let activePruneTimer: ReturnType<typeof setInterval> | null = null;
 // state if its generation is still the current one.
 let sessionGen = 0;
 
-const delay = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+// MUST be the background-safe sleep, never setTimeout: React Native freezes JS
+// timers whenever the activity pauses (screen off / pocketed phone), which froze
+// the segment-reader loop mid-cast — the TV starved and stopped within seconds
+// while native ffmpeg kept transcoding into the void.
+const delay = (ms: number) => backgroundSleep(ms);
 
 async function clearLiveDir(): Promise<void> {
   try {
@@ -73,11 +76,7 @@ export function isLiveRunning(): boolean {
 
 /** Cancel the remux (if any) and wipe its segment dir. Idempotent. */
 export async function stopLiveRemux(): Promise<void> {
-  running = false;
-  if (activePruneTimer) {
-    clearInterval(activePruneTimer);
-    activePruneTimer = null;
-  }
+  running = false; // also ends the session's pruner loop (see startSegmenter)
   if (sessionId != null) {
     const id = sessionId;
     sessionId = null;
@@ -117,18 +116,23 @@ async function startSegmenter(args: string[], pinFirstSegment: boolean): Promise
   // an uninitializable stream and hung in TRANSITIONING. Now nothing is deleted on
   // send: a background pruner drops segments that fall RETAIN_SEGMENTS behind the live
   // edge, and seg #0 is pinned for the whole session (see pickStaleSegments).
-  const pruneTimer = setInterval(async () => {
-    if (!running) return;
-    try {
-      const names = (await readDir(LIVE_DIR)).map((e) => e.name);
-      for (const name of pickStaleSegments(names, RETAIN_SEGMENTS, pinFirstSegment)) {
-        unlink(`${LIVE_DIR}/${name}`).catch(() => {});
+  // A background-safe `delay` loop, NOT setInterval — JS intervals freeze with the
+  // screen off, which would let the segment dir grow unbounded in a pocket. The loop
+  // ends itself when this session stops or is superseded.
+  void (async () => {
+    while (running && gen === sessionGen) {
+      await delay(PRUNE_INTERVAL_MS);
+      if (!running || gen !== sessionGen) break;
+      try {
+        const names = (await readDir(LIVE_DIR)).map((e) => e.name);
+        for (const name of pickStaleSegments(names, RETAIN_SEGMENTS, pinFirstSegment)) {
+          unlink(`${LIVE_DIR}/${name}`).catch(() => {});
+        }
+      } catch {
+        /* transient */
       }
-    } catch {
-      /* transient */
     }
-  }, PRUNE_INTERVAL_MS);
-  activePruneTimer = pruneTimer;
+  })();
 
   /**
    * Independent reader per HTTP connection: each has its OWN cursor starting at the
@@ -247,6 +251,22 @@ export interface LiveTranscodeTuning {
 }
 
 /**
+ * The three decoder→encoder pipelines, strongest first:
+ *  - 'surface': full zero-copy hardware path (`-hwaccel_output_format mediacodec`) —
+ *    frames go decoder → encoder on the codec silicon, no per-frame CPU work. This is
+ *    the only pipeline that keeps up with the SCREEN OFF: pocketing the phone caps the
+ *    CPU clocks and the copy/scale/convert pipelines drop to ~0.5× real time (measured
+ *    on Pixel 9), starving the TV within seconds — but the codec hardware isn't
+ *    throttled. No software filters are possible on hw frames, so it can't downscale
+ *    (callers only request it for sources within the TV's 1080p ceiling).
+ *  - 'hwvf': HW decode + software scale/format + HW encode — needed when the source
+ *    must be downscaled (>1080p). Fast with the screen on; falls behind pocketed.
+ *  - 'swvf': software decode fallback for sources whose codec/profile the HW decoder
+ *    rejects.
+ */
+type TranscodePipeline = 'surface' | 'hwvf' | 'swvf';
+
+/**
  * Transcode a LOCAL file (HEVC etc. the TV can't play) into rolling H.264/AAC MPEG-TS
  * segments and return a {@link LiveSource}. Because the hardware encoder runs faster
  * than 1x playback, the TV can start almost immediately and the encoder stays ahead —
@@ -265,13 +285,20 @@ export async function startLiveTranscode(
   }
   // nv12 downconverts 10-bit HDR → 8-bit and gives the HW encoder the format it wants.
   vf.push('format=nv12');
-  const buildArgs = (input: string): string[] => [
+  const buildArgs = (input: string, pipeline: TranscodePipeline): string[] => [
     '-hide_banner',
     '-loglevel',
     'error',
     // Pace reading to ~1x real time — the config that plays on the Freestyle.
     '-re',
-    ...(tuning.hwDecode ? ['-hwaccel', 'mediacodec'] : []),
+    // 'surface' decodes to hardware frames the encoder consumes directly (zero-copy);
+    // 'hwvf' downloads decoded frames to system memory for the -vf chain; 'swvf'
+    // decodes in software (fallback for codecs/profiles the HW decoder rejects).
+    ...(pipeline === 'surface'
+      ? ['-hwaccel', 'mediacodec', '-hwaccel_output_format', 'mediacodec']
+      : pipeline === 'hwvf'
+        ? ['-hwaccel', 'mediacodec']
+        : []),
     '-i',
     input,
     '-c:v',
@@ -286,8 +313,8 @@ export async function startLiveTranscode(
     ...(tuning.fps && tuning.fps > 0
       ? ['-g', String(Math.max(1, Math.round(tuning.fps * SEGMENT_SECONDS)))]
       : []),
-    '-vf',
-    vf.join(','),
+    // Software filters can't touch hardware frames — the surface path encodes as-is.
+    ...(pipeline === 'surface' ? [] : ['-vf', vf.join(',')]),
     // NOTE: no `-bsf:v` of any kind here. BOTH h264_mp4toannexb and dump_extra crash
     // this build's h264_mediacodec pipeline ("non-NULL packet sent after an EOF" →
     // "Error submitting a packet for bitstream filtering", killing the video ~1s in).
@@ -309,25 +336,37 @@ export async function startLiveTranscode(
     `${LIVE_DIR}/seg%06d.ts`,
   ];
 
-  // Auto-retry the flaky first start (AVERROR_INVALIDDATA from an unreleased SAF/HW
-  // handle) with a FRESH input token each time — automating the manual "retry until it
-  // plays". Return as soon as ffmpeg is actually producing output.
+  // Pipelines to try, strongest first. Zero-copy is only possible when no downscale
+  // is needed (no software filters on hw frames) — the caller omits scaleTo for any
+  // source within the TV's own ceiling precisely so this path is available.
+  const pipelines: TranscodePipeline[] = tuning.scaleTo
+    ? ['hwvf', 'swvf']
+    : ['surface', 'hwvf', 'swvf'];
+
+  // Try each pipeline up to twice: the first start after a supersede is flaky
+  // (AVERROR_INVALIDDATA from an unreleased SAF/HW handle — retrying with a FRESH
+  // input token reliably succeeds), while a pipeline that fails twice is genuinely
+  // unsupported (e.g. the HW decoder rejecting a 10-bit profile) → next pipeline.
   let source: LiveSource | null = null;
-  for (let attempt = 1; attempt <= TRANSCODE_START_ATTEMPTS; attempt++) {
-    const input = await ffmpegInput(sourceUri); // fresh SAF token per attempt
-    // pin seg #0: it carries the only SPS/PPS this encoder emits (see startSegmenter).
-    source = await startSegmenter(buildArgs(input), true); // supersedes any prior session
-    if (await firstOutputReady()) {
-      if (attempt > 1) console.log(`[live-ff] transcode producing on attempt ${attempt}`);
-      return source;
+  for (const pipeline of pipelines) {
+    for (let attempt = 1; attempt <= 2; attempt++) {
+      const input = await ffmpegInput(sourceUri); // fresh SAF token per attempt
+      // pin seg #0: it carries the only SPS/PPS this encoder emits (see startSegmenter).
+      source = await startSegmenter(buildArgs(input, pipeline), true); // supersedes prior
+      if (await firstOutputReady()) {
+        console.log(`[live-ff] transcode producing via '${pipeline}' (attempt ${attempt})`);
+        return source;
+      }
+      console.log(
+        `[live-ff] pipeline '${pipeline}' attempt ${attempt}/2 produced no output — ${
+          attempt < 2 ? 'retrying' : 'trying next pipeline'
+        }`,
+      );
+      await delay(RETRY_DELAY_MS);
     }
-    console.log(
-      `[live-ff] attempt ${attempt}/${TRANSCODE_START_ATTEMPTS} produced no output (input/HW not released yet) — retrying`,
-    );
-    await delay(RETRY_DELAY_MS);
   }
-  // All attempts failed to confirm output; return the last source so the cast surfaces
-  // a clean error rather than hanging.
+  // All pipelines failed to confirm output; return the last source so the cast
+  // surfaces a clean error rather than hanging.
   return source as LiveSource;
 }
 

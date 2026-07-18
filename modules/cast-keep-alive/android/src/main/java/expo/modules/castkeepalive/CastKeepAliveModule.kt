@@ -4,8 +4,11 @@ import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.PowerManager
 import android.provider.Settings
+import expo.modules.kotlin.Promise
 import expo.modules.kotlin.modules.Module
 import expo.modules.kotlin.modules.ModuleDefinition
 
@@ -19,6 +22,20 @@ import expo.modules.kotlin.modules.ModuleDefinition
  */
 class CastKeepAliveModule : Module() {
   private var started = false
+  // Background-safe timer thread. React Native's own JS timers (setTimeout /
+  // setInterval) are driven by the UI Choreographer and PAUSE whenever the
+  // activity pauses (screen off) — even with the service's partial wakelock held.
+  // Promises resolved from native, however, keep dispatching to the JS thread,
+  // so `sleep` gives JS a delay that keeps ticking with the screen off. A plain
+  // HandlerThread is lifecycle-independent; the wakelock keeps its clock honest.
+  private var timerHandler: Handler? = null
+
+  private fun timers(): Handler {
+    timerHandler?.let { return it }
+    val thread = HandlerThread("CastKeepAliveTimers")
+    thread.start()
+    return Handler(thread.looper).also { timerHandler = it }
+  }
 
   override fun definition() = ModuleDefinition {
     Name("CastKeepAlive")
@@ -26,7 +43,18 @@ class CastKeepAliveModule : Module() {
     Events("onTransportCommand")
 
     OnCreate { instance = this@CastKeepAliveModule }
-    OnDestroy { if (instance === this@CastKeepAliveModule) instance = null }
+    OnDestroy {
+      if (instance === this@CastKeepAliveModule) instance = null
+      timerHandler?.looper?.quitSafely()
+      timerHandler = null
+    }
+
+    // Resolve after `ms` — a setTimeout replacement that KEEPS RUNNING with the
+    // screen off (see timerHandler above). Playback-critical waits (live-segment
+    // polling, DLNA status polls) must use this instead of JS timers.
+    AsyncFunction("sleep") { ms: Double, promise: Promise ->
+      timers().postDelayed({ promise.resolve(null) }, ms.toLong().coerceAtLeast(0))
+    }
 
     Function("present") { title: String, state: String, position: Double, duration: Double, controls: Boolean, artworkPath: String, volume: Double ->
       val context = appContext.reactContext
