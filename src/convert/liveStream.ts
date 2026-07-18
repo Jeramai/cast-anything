@@ -347,12 +347,11 @@ export async function startLiveTranscode(
   // (AVERROR_INVALIDDATA from an unreleased SAF/HW handle — retrying with a FRESH
   // input token reliably succeeds), while a pipeline that fails twice is genuinely
   // unsupported (e.g. the HW decoder rejecting a 10-bit profile) → next pipeline.
-  let source: LiveSource | null = null;
   for (const pipeline of pipelines) {
     for (let attempt = 1; attempt <= 2; attempt++) {
       const input = await ffmpegInput(sourceUri); // fresh SAF token per attempt
       // pin seg #0: it carries the only SPS/PPS this encoder emits (see startSegmenter).
-      source = await startSegmenter(buildArgs(input, pipeline), true); // supersedes prior
+      const source = await startSegmenter(buildArgs(input, pipeline), true); // supersedes prior
       if (await firstOutputReady()) {
         console.log(`[live-ff] transcode producing via '${pipeline}' (attempt ${attempt})`);
         return source;
@@ -365,9 +364,12 @@ export async function startLiveTranscode(
       await delay(RETRY_DELAY_MS);
     }
   }
-  // All pipelines failed to confirm output; return the last source so the cast
-  // surfaces a clean error rather than hanging.
-  return source as LiveSource;
+  // No pipeline produced output — this file can't be transcoded on this device (e.g. a
+  // codec/profile every MediaCodec path rejects). Stop the dead session and throw so
+  // the caller can react (a queued item gets skipped + greyed; a single cast surfaces
+  // the error) rather than handing the TV a stream that never yields a frame.
+  await stopLiveRemux();
+  throw new Error('This file can’t be played on this TV, even by transcoding.');
 }
 
 /**

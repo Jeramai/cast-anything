@@ -454,11 +454,14 @@ function queueKey(item: MediaItem): string {
 function QueueRow({
   item,
   active,
+  disabled,
   onPlay,
   onRemove,
 }: {
   item: MediaItem;
   active: boolean;
+  /** True when this TV can't play the file even by transcoding — greyed + not tappable. */
+  disabled: boolean;
   onPlay: () => void;
   onRemove: () => void;
 }) {
@@ -487,25 +490,31 @@ function QueueRow({
   return (
     <Animated.View style={{ transform: [{ translateX }] }} {...panRef.current.panHandlers}>
       <Pressable
-        onPress={onPlay}
-        style={[styles.queueRow, active && styles.queueRowActive]}
+        onPress={disabled ? undefined : onPlay}
+        disabled={disabled}
+        style={[styles.queueRow, active && styles.queueRowActive, disabled && styles.queueRowDisabled]}
       >
         <Ionicons
           name={
-            active
-              ? "play"
-              : item.kind === "audio"
-                ? "musical-notes"
-                : item.kind === "image"
-                  ? "image"
-                  : "film"
+            disabled
+              ? "alert-circle"
+              : active
+                ? "play"
+                : item.kind === "audio"
+                  ? "musical-notes"
+                  : item.kind === "image"
+                    ? "image"
+                    : "film"
           }
           size={16}
-          color={active ? C.accent : C.textDim}
+          color={disabled ? C.textDim : active ? C.accent : C.textDim}
         />
-        <Text style={styles.queueName} numberOfLines={1}>
-          {item.name}
-        </Text>
+        <View style={styles.grow}>
+          <Text style={styles.queueName} numberOfLines={1}>
+            {item.name}
+          </Text>
+          {disabled && <Text style={styles.queueNote}>Can’t play on this TV — swipe to remove</Text>}
+        </View>
         <Pressable onPress={onRemove} hitSlop={10}>
           <Ionicons name="close" size={16} color={C.textDim} />
         </Pressable>
@@ -617,7 +626,7 @@ function CastScreen() {
               style={styles.grow}
             />
           </View>
-          <View style={[styles.urlRow, { marginTop: 8 }]}>
+          <View style={styles.urlRow}>
             <TextInput
               value={urlInput}
               onChangeText={setUrlInput}
@@ -641,7 +650,7 @@ function CastScreen() {
           {/* The single selected file, with only the actions that apply to it. */}
           {cast.media && (
             <>
-              <View style={[styles.mediaCard, { marginTop: 8 }]}>
+              <View style={styles.mediaCard}>
                 <Ionicons
                   name={
                     cast.media.kind === "audio"
@@ -661,7 +670,7 @@ function CastScreen() {
                   <Ionicons name="close" size={18} color={C.textDim} />
                 </Pressable>
               </View>
-              <View style={[styles.pickRow, { marginTop: 8 }]}>
+              <View style={styles.pickRow}>
                 {cast.canConvert && cast.media.isLocal && cast.media.kind !== "image" && (
                   <Button
                     icon="sync"
@@ -693,6 +702,7 @@ function CastScreen() {
                 key={queueKey(it)}
                 item={it}
                 active={i === cast.queueIndex}
+                disabled={cast.unplayable.has(it.uri)}
                 onPlay={() => cast.playQueueAt(i)}
                 onRemove={() => cast.removeFromQueue(i)}
               />
@@ -1399,7 +1409,9 @@ function makeStyles(C: ThemePalette) {
     marginBottom: 6,
   },
   queueRowActive: { backgroundColor: C.accentDim },
-  queueName: { color: C.text, fontSize: 13, flex: 1 },
+  queueRowDisabled: { opacity: 0.45 },
+  queueName: { color: C.text, fontSize: 13 },
+  queueNote: { color: C.textDim, fontSize: 11, marginTop: 2 },
   queueActions: { flexDirection: "row", gap: 8, marginTop: 4 },
   subActiveRow: {
     flexDirection: "row",

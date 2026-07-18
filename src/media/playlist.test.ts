@@ -96,6 +96,54 @@ describe('retreat (Previous)', () => {
   });
 });
 
+describe('blocked (unplayable) items are skipped', () => {
+  test('advance skips a single blocked item', () => {
+    // [A, B, C], B blocked: from A the next playable is C.
+    expect(advance(state({ length: 3, current: 0, blocked: new Set([1]) }), false)).toBe(2);
+  });
+
+  test('advance skips consecutive blocked items', () => {
+    // [A, B, C, D], B and C blocked: from A → D.
+    expect(advance(state({ length: 4, current: 0, blocked: new Set([1, 2]) }), false)).toBe(3);
+  });
+
+  test('advance returns null when only blocked items remain (repeat off)', () => {
+    expect(advance(state({ length: 3, current: 0, blocked: new Set([1, 2]) }), false)).toBeNull();
+  });
+
+  test('advance with repeat-all wraps past blocked items to a playable one', () => {
+    // [A, B, C], current C, B blocked, repeat all → wraps to A.
+    expect(advance(state({ length: 3, current: 2, repeat: 'all', blocked: new Set([1]) }), false)).toBe(0);
+  });
+
+  test('advance with repeat-all returns null when every item is blocked (no infinite loop)', () => {
+    expect(
+      advance(state({ length: 3, current: 0, repeat: 'all', blocked: new Set([0, 1, 2]) }), false),
+    ).toBeNull();
+  });
+
+  test('advance skips blocked items in a shuffled order', () => {
+    const order = [2, 0, 1];
+    // playing 2, order says next is 0; 0 blocked → skip to 1.
+    expect(advance({ length: 3, current: 2, order, repeat: 'off', blocked: new Set([0]) }, false)).toBe(1);
+  });
+
+  test('repeat-one on a blocked current still moves to the next playable', () => {
+    // Shouldn't normally happen (we never play a blocked item), but must not loop forever.
+    expect(advance(state({ length: 3, current: 0, repeat: 'one', blocked: new Set([0]) }), false)).toBe(1);
+  });
+
+  test('retreat skips blocked items backwards', () => {
+    // [A, B, C], current C, B blocked → previous playable is A.
+    expect(retreat(state({ length: 3, current: 2, blocked: new Set([1]) }))).toBe(0);
+  });
+
+  test('retreat with repeat-all wraps past blocked items', () => {
+    // [A, B, C], current A, C blocked, repeat all → wraps back to B.
+    expect(retreat(state({ length: 3, current: 0, repeat: 'all', blocked: new Set([2]) }))).toBe(1);
+  });
+});
+
 describe('indexAfterRemoval', () => {
   test('removing an earlier item shifts current down', () => {
     expect(indexAfterRemoval(2, 0, 3)).toBe(1);

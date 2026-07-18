@@ -37,6 +37,13 @@ export interface NavState {
   /** The play order (a permutation of [0..length-1]); see {@link makeOrder}. */
   order: number[];
   repeat: RepeatMode;
+  /**
+   * Queue indices that can't be played (a file even on-the-fly transcode couldn't
+   * make castable) and must be skipped over. Navigation walks past them to the next
+   * playable item; when only blocked items remain it returns null (→ stop). Omit
+   * (or empty) when nothing is blocked. See useCast's unplayable set.
+   */
+  blocked?: ReadonlySet<number>;
 }
 
 /** Position of `current` within `order`, or -1 if not present. */
@@ -44,36 +51,62 @@ function orderPos(order: number[], current: number): number {
   return order.indexOf(current);
 }
 
+const isBlocked = (blocked: ReadonlySet<number> | undefined, index: number): boolean =>
+  blocked != null && blocked.has(index);
+
 /**
  * The queue index to play next, or null if playback should stop.
  *
  * `manual` distinguishes an auto-advance (a track ended) from the user pressing
  * Next: repeat-one replays the same track on auto-advance, but Next still moves on.
  * At the end of the order we wrap only when repeat is 'all'; otherwise we stop (null).
+ * Blocked (unplayable) indices are skipped; if none remain playable, returns null.
  */
 export function advance(state: NavState, manual: boolean): number | null {
-  const { length, current, order, repeat } = state;
+  const { length, current, order, repeat, blocked } = state;
   if (length === 0) return null;
-  if (repeat === 'one' && !manual) return current >= 0 ? current : (order[0] ?? null);
+  if (repeat === 'one' && !manual && current >= 0 && !isBlocked(blocked, current)) {
+    return current;
+  }
   const pos = orderPos(order, current);
-  // Nothing playing yet (or current fell out of the order) → start at the front.
-  if (pos < 0) return order[0] ?? null;
-  if (pos + 1 < order.length) return order[pos + 1];
-  return repeat === 'all' ? (order[0] ?? null) : null;
+  const wrap = repeat === 'all';
+  // Walk forward from just after the current position, wrapping only for repeat-all,
+  // visiting each slot at most once (the bound prevents an infinite loop when every
+  // remaining item is blocked), and return the first playable one.
+  for (let step = 1; step <= order.length; step++) {
+    const p = pos + step;
+    if (p >= order.length && !wrap) break;
+    const idx = order[((p % order.length) + order.length) % order.length];
+    if (!isBlocked(blocked, idx)) return idx;
+  }
+  return null;
 }
 
 /**
  * The queue index to play when the user presses Previous. Steps back through the
  * order, wrapping to the end only when repeat is 'all'; at the very start (no wrap)
- * it restarts the current item rather than stopping.
+ * it restarts the current item rather than stopping. Blocked indices are skipped.
  */
 export function retreat(state: NavState): number | null {
-  const { length, current, order, repeat } = state;
+  const { length, current, order, repeat, blocked } = state;
   if (length === 0) return null;
   const pos = orderPos(order, current);
-  if (pos < 0) return order[0] ?? null;
-  if (pos - 1 >= 0) return order[pos - 1];
-  return repeat === 'all' ? (order[order.length - 1] ?? null) : order[0] ?? null;
+  const wrap = repeat === 'all';
+  if (pos < 0) {
+    for (let i = 0; i < order.length; i++) {
+      if (!isBlocked(blocked, order[i])) return order[i];
+    }
+    return null;
+  }
+  for (let step = 1; step <= order.length; step++) {
+    const p = pos - step;
+    // Reached the start without wrapping: restart the current item (if it's playable),
+    // matching the original "Previous at the top restarts" behavior.
+    if (p < 0 && !wrap) return !isBlocked(blocked, current) ? current : null;
+    const idx = order[((p % order.length) + order.length) % order.length];
+    if (!isBlocked(blocked, idx)) return idx;
+  }
+  return null;
 }
 
 /**

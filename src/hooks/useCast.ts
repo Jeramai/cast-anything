@@ -204,6 +204,9 @@ export interface UseCast {
   queue: MediaItem[];
   /** Index of the currently-playing queue item, or -1 when not playing from the queue. */
   queueIndex: number;
+  /** URIs of queue files this TV can't play even by transcoding — shown greyed/disabled
+   *  and skipped by navigation. Discovered lazily on a failed cast attempt. */
+  unplayable: ReadonlySet<string>;
   /** Whether the queue plays in a shuffled order. */
   shuffle: boolean;
   /** Repeat behavior: off / repeat-all / repeat-one. */
@@ -354,6 +357,28 @@ export function useCast(): UseCast {
   // committing state or sending the TV a superseded SetAVTransportURI — rapid Next taps
   // and Stop-during-auto-advance would otherwise race on the single served-file slot.
   const castSeqRef = useRef(0);
+  // URIs of queue files this TV can't play even by transcoding (discovered lazily when
+  // a cast attempt returns 'skip'). Such items are greyed out in the queue and skipped
+  // by navigation, so one bad file never dead-ends the queue. Kept as state (drives the
+  // greyed UI) plus a ref mirror (read synchronously by the stable nav callbacks).
+  const [unplayable, setUnplayable] = useState<ReadonlySet<string>>(() => new Set());
+  const unplayableRef = useRef<ReadonlySet<string>>(unplayable);
+  const markUnplayable = useCallback((uri: string) => {
+    if (unplayableRef.current.has(uri)) return;
+    const next = new Set(unplayableRef.current).add(uri);
+    unplayableRef.current = next;
+    setUnplayable(next);
+  }, []);
+  // Queue indices whose file is known-unplayable — the `blocked` set navigation skips.
+  const blockedIndices = useCallback((): Set<number> => {
+    const blocked = new Set<number>();
+    const q = queueRef.current;
+    const bad = unplayableRef.current;
+    for (let i = 0; i < q.length; i++) {
+      if (bad.has(q[i].uri)) blocked.add(i);
+    }
+    return blocked;
+  }, []);
 
   const stopPolling = useCallback(() => {
     pollRef.current = null; // the loop sees its token replaced and exits
@@ -509,10 +534,13 @@ export function useCast(): UseCast {
     setVol(null); // volume is per-device; re-read on next cast
     setSeekSupported(!seekUnsupportedDevices.has(d.id));
     // A different TV might play a file the last one couldn't, so clear the
-    // "can't cast this — stream it instead" fallback: the normal Cast button
-    // comes back so the user can retry on the newly-selected device.
+    // "can't cast this — stream it instead" fallback and the queue's unplayable
+    // marks: the normal Cast button comes back and greyed queue rows get a fresh
+    // chance on the newly-selected device.
     setStreamUrl(null);
     setCanStreamViaUrl(false);
+    unplayableRef.current = new Set();
+    setUnplayable(unplayableRef.current);
   }, []);
 
   // Detach any subtitle (called when a different item is chosen — the subtitle
@@ -678,13 +706,14 @@ export function useCast(): UseCast {
   // fallback UI (Play now / Stream via URL need `media`, which a queue item isn't).
   //
   // Returns the outcome so queue logic can react: 'ok' (playing), 'failed' (error
-  // surfaced — the queue should tear down rather than stay stuck "PLAYING"), or
-  // 'superseded' (a newer cast/Stop took over mid-flight — do nothing).
+  // surfaced — the queue should tear down rather than stay stuck "PLAYING"),
+  // 'superseded' (a newer cast/Stop took over mid-flight — do nothing), or 'skip' (a
+  // queued file this TV can't play even by transcoding — grey it out and move on).
   const castItem = useCallback(
     async (
       item: MediaItem,
       castOpts: { liveTranscode?: boolean; fromQueue?: boolean } = {},
-    ): Promise<'ok' | 'failed' | 'superseded'> => {
+    ): Promise<'ok' | 'failed' | 'superseded' | 'skip'> => {
     if (!selectedDevice) {
       setError('Pick a TV / device first.');
       return 'failed';
@@ -726,7 +755,10 @@ export function useCast(): UseCast {
     let servedFromPhone = false;
     let durationSec = 0;
     // Live on-the-fly transcode of a local file the TV can't play (play-while-transcoding).
-    const liveTranscode = castOpts.liveTranscode === true && ffmpegAvailable && item.isLocal;
+    // A queued file that needs re-encoding turns this on automatically (below), so the
+    // queue plays it instead of stopping — hence `let`, not `const`.
+    let liveTranscode = castOpts.liveTranscode === true && ffmpegAvailable && item.isLocal;
+    const canLiveTranscode = ffmpegAvailable && item.isLocal;
 
     console.log(
       `[cast] begin: name="${item.name}" kind=${item.kind} isLocal=${item.isLocal} live=${item.live === true} liveTranscode=${liveTranscode} device="${selectedDevice.friendlyName}"`,
@@ -748,25 +780,28 @@ export function useCast(): UseCast {
             `[cast] probe: container=${probe.container} vcodec=${probe.videoCodec} acodec=${probe.audioCodec} ${probe.width}x${probe.height} ${probe.fps ?? '?'}fps dur=${Math.round(probe.durationSec)}s`,
           );
           durationSec = probe.durationSec;
-          // The TV can't play this codec as-is (e.g. HEVC). Unless the caller explicitly
-          // chose play-while-transcoding, don't silently start a (potentially very long)
-          // transcode from a Cast tap.
+          // The TV can't play this codec as-is (e.g. HEVC).
           if (!liveTranscode && item.kind === 'video' && assessForCast(probe).videoPlan === 'reencode') {
-            if (castOpts.fromQueue) {
-              // The single-selection fallback UI (Play now / Stream via URL) works on
-              // `media`, which a queue item is not — offering it here would render
-              // dead-end buttons. Fail plainly; the queue tears down with the error.
+            if (castOpts.fromQueue && canLiveTranscode) {
+              // A queued file: transcode it on the fly (like "Play now") so the queue
+              // just plays it. If the transcode can't even start, the serve below
+              // returns 'skip' and the caller greys it out and moves on — the queue
+              // never dead-ends on one bad file.
+              console.log(`[cast] queue item needs re-encode — auto live-transcoding: ${item.name}`);
+              liveTranscode = true;
+            } else if (castOpts.fromQueue) {
+              // No FFmpeg / not local → can't transcode; skip it (greyed) rather than
+              // stopping the whole queue.
+              console.log(`[cast] queue item can't be transcoded here — skipping: ${item.name}`);
+              return 'skip';
+            } else {
+              // Single-selection cast: offer the choice (Play now / Convert / Stream via URL).
               setError(
-                `“${item.name}” can’t play on this TV as-is — Convert it first, then re-add it to the queue.`,
+                'Your TV can’t play this video as-is. Use “Play now” to watch it while it converts, “Convert” to save a playable copy, or Stream via URL.',
               );
+              setCanStreamViaUrl(true);
               return 'failed';
             }
-            // Single-selection cast: offer the choice (Play now / Convert / Stream via URL).
-            setError(
-              'Your TV can’t play this video as-is. Use “Play now” to watch it while it converts, “Convert” to save a playable copy, or Stream via URL.',
-            );
-            setCanStreamViaUrl(true);
-            return 'failed';
           }
         }
       }
@@ -815,12 +850,23 @@ export function useCast(): UseCast {
         console.log(
           `[cast] starting live transcode: scaleTo=${needScale ? `${preset.maxWidth}x${preset.maxHeight}` : 'none (zero-copy eligible)'} bitrate=${preset.bitRateMbps}M fps=${probe?.fps ?? '?'}`,
         );
-        url = await serveTranscodedFile(item.uri, {
-          scaleTo: needScale ? { w: preset.maxWidth, h: preset.maxHeight } : undefined,
-          bitRateMbps: preset.bitRateMbps,
-          hwDecode: true,
-          fps: probe?.fps,
-        });
+        try {
+          url = await serveTranscodedFile(item.uri, {
+            scaleTo: needScale ? { w: preset.maxWidth, h: preset.maxHeight } : undefined,
+            bitRateMbps: preset.bitRateMbps,
+            hwDecode: true,
+            fps: probe?.fps,
+          });
+        } catch (e) {
+          if (stale()) return 'superseded';
+          // The transcode couldn't start (no MediaCodec pipeline accepted this file).
+          // From the queue: skip + grey it out. Single selection: surface the error.
+          if (castOpts.fromQueue) {
+            console.log(`[cast] transcode failed to start — skipping queue item: ${item.name}`);
+            return 'skip';
+          }
+          throw e;
+        }
         console.log(`[cast] live transcode serving at ${url}`);
         castMime = 'video/mp2t';
       } else if (item.isLocal) {
@@ -987,31 +1033,45 @@ export function useCast(): UseCast {
         clearServedSubtitle();
       }
       void castItem(item, { fromQueue: true }).then((outcome) => {
-        if (outcome === 'failed') {
+        if (outcome === 'skip') {
+          // This TV can't play the file even by transcoding: grey it out and move to
+          // the next playable item. If none remain, tear down.
+          markUnplayable(item.uri);
+          if (!castNextRef.current(false)) {
+            console.log('[cast] no playable queue items left after skip — tearing down');
+            teardownPlayback();
+          }
+        } else if (outcome === 'failed') {
           console.log('[cast] queue item failed to start — tearing down');
           teardownPlayback();
         }
       });
     },
-    [castItem, teardownPlayback],
+    [castItem, teardownPlayback, markUnplayable],
   );
 
   // Advance to the next item (auto on end-of-media, or manual via Next). Returns
-  // false when there's nowhere to go (end of queue, repeat off) so finishPlayback
-  // can fall through to a real teardown.
+  // false when there's nowhere to go (end of queue, repeat off, or only unplayable
+  // items remain) so finishPlayback can fall through to a real teardown.
   const castNext = useCallback(
     (manual: boolean): boolean => {
       const q = queueRef.current;
       if (q.length === 0) return false;
       const idx = advance(
-        { length: q.length, current: queueIndexRef.current, order: orderRef.current, repeat: repeatRef.current },
+        {
+          length: q.length,
+          current: queueIndexRef.current,
+          order: orderRef.current,
+          repeat: repeatRef.current,
+          blocked: blockedIndices(),
+        },
         manual,
       );
       if (idx == null || !q[idx]) return false;
       playQueueIndex(idx);
       return true;
     },
-    [playQueueIndex],
+    [playQueueIndex, blockedIndices],
   );
   castNextRef.current = castNext;
 
@@ -1027,9 +1087,10 @@ export function useCast(): UseCast {
       current: queueIndexRef.current,
       order: orderRef.current,
       repeat: repeatRef.current,
+      blocked: blockedIndices(),
     });
     if (idx != null) playQueueIndex(idx);
-  }, [playQueueIndex]);
+  }, [playQueueIndex, blockedIndices]);
 
   const playQueueAt = useCallback(
     (index: number) => {
@@ -1103,6 +1164,8 @@ export function useCast(): UseCast {
   const clearQueue = useCallback(() => {
     queueIndexRef.current = -1;
     setQueueIndex(-1);
+    unplayableRef.current = new Set();
+    setUnplayable(unplayableRef.current);
     applyQueue([]);
   }, [applyQueue]);
 
@@ -1129,13 +1192,16 @@ export function useCast(): UseCast {
     });
   }, []);
 
-  // Start the queue from its first (possibly shuffled) slot.
+  // Start the queue from its first playable (possibly shuffled) slot — skip any items
+  // already known-unplayable so pressing Play doesn't open on a greyed one.
   const startQueue = useCallback(() => {
     const q = queueRef.current;
     if (q.length === 0) return;
     orderRef.current = makeOrder(q.length, shuffleRef.current);
-    playQueueIndex(orderRef.current[0] ?? 0);
-  }, [playQueueIndex]);
+    const blocked = blockedIndices();
+    const first = orderRef.current.find((idx) => !blocked.has(idx)) ?? orderRef.current[0] ?? 0;
+    playQueueIndex(first);
+  }, [playQueueIndex, blockedIndices]);
 
   // The primary Cast action: play the built queue if there is one, else cast the
   // single current selection (the classic one-shot flow, with an empty queue).
@@ -1615,6 +1681,7 @@ export function useCast(): UseCast {
     setConvertQuality,
     queue,
     queueIndex,
+    unplayable,
     shuffle,
     repeatMode,
     enqueue,
