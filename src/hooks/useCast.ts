@@ -347,7 +347,9 @@ export function useCast(): UseCast {
   // Mirror of `status` for callbacks that need the latest value without being
   // re-created (e.g. onSeek deciding whether to resume after a pause-seek).
   const statusRef = useRef<PlaybackStatus>('IDLE');
-  statusRef.current = status;
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
 
   // Playlist state mirrored into refs so the poll-driven auto-advance and the
   // (stable) navigation callbacks read the latest queue without being re-created.
@@ -1099,7 +1101,9 @@ export function useCast(): UseCast {
     },
     [playQueueIndex, blockedIndices],
   );
-  castNextRef.current = castNext;
+  useEffect(() => {
+    castNextRef.current = castNext;
+  }, [castNext]);
 
   const next = useCallback(() => {
     castNext(true);
@@ -1196,26 +1200,28 @@ export function useCast(): UseCast {
   }, [applyQueue]);
 
   const toggleShuffle = useCallback(() => {
-    setShuffle((s) => {
-      const nextShuffle = !s;
-      shuffleRef.current = nextShuffle;
-      let order = makeOrder(queueRef.current.length, nextShuffle);
-      // Keep the currently-playing item at the front of the (re)built order so
-      // advance() continues from it and still visits every other item — an
-      // unanchored fresh permutation would skip whatever landed before it.
-      const cur = queueIndexRef.current;
-      if (cur >= 0 && cur < queueRef.current.length) order = anchorOrder(order, cur);
-      orderRef.current = order;
-      return nextShuffle;
-    });
+    // shuffleRef mirrors the `shuffle` state, so it already holds the current value.
+    // Compute the next order + do the ref writes here (not inside the setShuffle
+    // updater, which must stay pure), then hand setShuffle the plain next value.
+    const nextShuffle = !shuffleRef.current;
+    shuffleRef.current = nextShuffle;
+    let order = makeOrder(queueRef.current.length, nextShuffle);
+    // Keep the currently-playing item at the front of the (re)built order so
+    // advance() continues from it and still visits every other item — an
+    // unanchored fresh permutation would skip whatever landed before it.
+    const cur = queueIndexRef.current;
+    if (cur >= 0 && cur < queueRef.current.length) order = anchorOrder(order, cur);
+    orderRef.current = order;
+    setShuffle(nextShuffle);
   }, []);
 
   const cycleRepeat = useCallback(() => {
-    setRepeatMode((r) => {
-      const nextMode: RepeatMode = r === 'off' ? 'all' : r === 'all' ? 'one' : 'off';
-      repeatRef.current = nextMode;
-      return nextMode;
-    });
+    // repeatRef mirrors the `repeatMode` state; read it as the current value, do the
+    // ref write here, and pass setRepeatMode the plain next value (updater must be pure).
+    const r = repeatRef.current;
+    const nextMode: RepeatMode = r === 'off' ? 'all' : r === 'all' ? 'one' : 'off';
+    repeatRef.current = nextMode;
+    setRepeatMode(nextMode);
   }, []);
 
   // Start the queue from its first playable (possibly shuffled) slot — skip any items
@@ -1604,23 +1610,25 @@ export function useCast(): UseCast {
   const transportRef = useRef<(action: TransportAction, value: number | null) => void>(
     () => {},
   );
-  transportRef.current = (action, value) => {
-    if (signage) {
-      if (action === 'play') sigPlay();
-      else if (action === 'pause') sigPause();
-      else if (action === 'stop') sigPause(); // signage has no hard stop — pause
-      else if (action === 'seekBy') sigSeek(value ?? 0);
-      else if (action === 'seekTo') sigSeekTo(value ?? 0);
-      // 'volumeTo' ignored — signage panels have no volume channel.
-    } else {
-      if (action === 'play') onPlay();
-      else if (action === 'pause') onPause();
-      else if (action === 'stop') onStop();
-      else if (action === 'seekBy') onSeek(Math.max(0, pbPosition + (value ?? 0)));
-      else if (action === 'seekTo') onSeek(value ?? 0);
-      else if (action === 'volumeTo') onVolumeSet(value ?? 0);
-    }
-  };
+  useEffect(() => {
+    transportRef.current = (action, value) => {
+      if (signage) {
+        if (action === 'play') sigPlay();
+        else if (action === 'pause') sigPause();
+        else if (action === 'stop') sigPause(); // signage has no hard stop — pause
+        else if (action === 'seekBy') sigSeek(value ?? 0);
+        else if (action === 'seekTo') sigSeekTo(value ?? 0);
+        // 'volumeTo' ignored — signage panels have no volume channel.
+      } else {
+        if (action === 'play') onPlay();
+        else if (action === 'pause') onPause();
+        else if (action === 'stop') onStop();
+        else if (action === 'seekBy') onSeek(Math.max(0, pbPosition + (value ?? 0)));
+        else if (action === 'seekTo') onSeek(value ?? 0);
+        else if (action === 'volumeTo') onVolumeSet(value ?? 0);
+      }
+    };
+  }, [signage, sigPlay, sigPause, sigSeek, sigSeekTo, onPlay, onPause, onStop, onSeek, onVolumeSet, pbPosition]);
   useEffect(() => {
     const sub = addTransportCommandListener((action, value) =>
       transportRef.current(action, value),

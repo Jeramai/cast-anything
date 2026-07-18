@@ -1,6 +1,8 @@
 import { StatusBar } from "expo-status-bar";
 import {
   createContext,
+  memo,
+  useCallback,
   useContext,
   useEffect,
   useMemo,
@@ -11,6 +13,7 @@ import {
 import {
   ActivityIndicator,
   Animated,
+  FlatList,
   KeyboardAvoidingView,
   Modal,
   PanResponder,
@@ -23,6 +26,7 @@ import {
   TextInput,
   useColorScheme,
   View,
+  type ListRenderItemInfo,
   type PressableProps,
 } from "react-native";
 import { SafeAreaProvider, SafeAreaView } from "react-native-safe-area-context";
@@ -32,6 +36,7 @@ import * as Clipboard from "expo-clipboard";
 import type { DlnaDevice } from "./src/dlna";
 import { useCast } from "./src/hooks/useCast";
 import type { MediaItem } from "./src/media/mime";
+import type { SubtitleResult } from "./src/subtitles/subdl";
 import type { OutputMode } from "./src/convert/gallery";
 import { CONVERT_QUALITY_LABELS } from "./src/convert/quality";
 import { setScreenAwake } from "./src/background/keepAlive";
@@ -217,7 +222,10 @@ function NowPlayingSheet({
   // snap thresholds would use a stale height. Mirror `range` into a ref the handlers
   // read live.
   const rangeRef = useRef(range);
-  rangeRef.current = range;
+  // Write after commit (not during render) so render stays pure; the handlers read it live.
+  useEffect(() => {
+    rangeRef.current = range;
+  });
 
   // Lazy-init so the Animated.Value isn't reconstructed on every render.
   const translateYRef = useRef<Animated.Value | null>(null);
@@ -266,7 +274,10 @@ function NowPlayingSheet({
   // snapTo is redefined each render (fresh `range`), but the PanResponder captures the
   // FIRST one, so route its calls through a ref that tracks the latest.
   const snapToRef = useRef(snapTo);
-  snapToRef.current = snapTo;
+  // Write after commit (not during render) so render stays pure; the handlers read it live.
+  useEffect(() => {
+    snapToRef.current = snapTo;
+  });
 
   const barWidthRef = useRef(0);
   const panRef = useRef<ReturnType<typeof PanResponder.create> | null>(null);
@@ -537,6 +548,28 @@ function QueueRow({
   );
 }
 
+// A single SUBDL search result row. memo + a stable `onAttach` let the FlatList skip
+// re-rendering rows whose data hasn't changed as it windows the list.
+const SubResultRow = memo(function SubResultRow({
+  item,
+  onAttach,
+}: {
+  item: SubtitleResult;
+  onAttach: (r: SubtitleResult) => void;
+}) {
+  const { styles } = useTheme();
+  const onPress = useCallback(() => onAttach(item), [onAttach, item]);
+  return (
+    <Pressable style={styles.subResultRow} onPress={onPress}>
+      <Text style={styles.subResultTitle} numberOfLines={1}>
+        {item.release}
+      </Text>
+      <Text style={styles.subResultMeta}>{item.language.toUpperCase()}</Text>
+    </Pressable>
+  );
+});
+const subResultKey = (r: SubtitleResult) => r.url;
+
 function CastScreen() {
   const { C, styles, baseKey, accentKey, setBaseKey, setAccentKey } = useTheme();
   const cast = useCast();
@@ -556,7 +589,11 @@ function CastScreen() {
   // close-diff sees the final choice without re-running mid-preview. No-ops gracefully
   // if the native module is absent (older dev build) — the icon updates next rebuild.
   const accentLatest = useRef(accentKey);
-  accentLatest.current = accentKey;
+  // Write after commit (not during render) so render stays pure. Declared before the
+  // open/close effect below, so on close the ref already holds the final accent.
+  useEffect(() => {
+    accentLatest.current = accentKey;
+  });
   const accentAtOpen = useRef(accentKey);
   useEffect(() => {
     if (settingsOpen) accentAtOpen.current = accentLatest.current;
@@ -577,6 +614,15 @@ function CastScreen() {
   // option to take them off the screen. Audio/video get the full transport.
   // Based on what's actually casting (nowPlaying), not the live selection.
   const isImage = cast.nowPlaying?.kind === "image";
+
+  // Stable renderItem so the subtitle-results FlatList windows without rebuilding rows
+  // (cast.attachSub is itself stable — a useCallback in the hook).
+  const renderSubResult = useCallback(
+    ({ item }: ListRenderItemInfo<SubtitleResult>) => (
+      <SubResultRow item={item} onAttach={cast.attachSub} />
+    ),
+    [cast.attachSub],
+  );
 
   return (
     <SafeAreaView style={styles.safe} edges={["top", "bottom"]}>
@@ -1187,16 +1233,13 @@ function CastScreen() {
                   loading={cast.searchingSubs}
                   onPress={() => cast.searchSubs(subLang)}
                 />
-                <ScrollView style={styles.subResults} showsVerticalScrollIndicator={false}>
-                  {cast.subResults.map((r) => (
-                    <Pressable key={r.url} style={styles.subResultRow} onPress={() => cast.attachSub(r)}>
-                      <Text style={styles.subResultTitle} numberOfLines={1}>
-                        {r.release}
-                      </Text>
-                      <Text style={styles.subResultMeta}>{r.language.toUpperCase()}</Text>
-                    </Pressable>
-                  ))}
-                </ScrollView>
+                <FlatList
+                  style={styles.subResults}
+                  showsVerticalScrollIndicator={false}
+                  data={cast.subResults}
+                  keyExtractor={subResultKey}
+                  renderItem={renderSubResult}
+                />
               </>
             ) : (
               <Text style={styles.hint}>

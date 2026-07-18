@@ -69,11 +69,6 @@ async function clearLiveDir(): Promise<void> {
   }
 }
 
-/** Whether the FFmpeg remux is currently producing segments. */
-export function isLiveRunning(): boolean {
-  return running;
-}
-
 /** Cancel the remux (if any) and wipe its segment dir. Idempotent. */
 export async function stopLiveRemux(): Promise<void> {
   running = false; // also ends the session's pruner loop (see startSegmenter)

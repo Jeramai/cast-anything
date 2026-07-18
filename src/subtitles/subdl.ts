@@ -32,13 +32,16 @@ export async function searchSubtitles(
   const json = await res.json();
   if (json?.status === false) throw new Error(json?.error || 'No subtitles found.');
   const subs: any[] = Array.isArray(json?.subtitles) ? json.subtitles : [];
-  return subs
-    .filter((s) => s?.url)
-    .map((s) => ({
+  const results: SubtitleResult[] = [];
+  for (const s of subs) {
+    if (!s?.url) continue;
+    results.push({
       url: s.url,
       language: String(s.language || s.lang || '?'),
       release: s.release_name || s.name || 'subtitle',
-    }));
+    });
+  }
+  return results;
 }
 
 /** Download the result's zip and return the .srt text it contains. */
