@@ -69,3 +69,4 @@ modules/**/.gradle/
 /app-release.aab
 *.aab
 *.apk
+coverage/

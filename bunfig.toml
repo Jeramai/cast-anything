@@ -1,4 +1,10 @@
 [test]
-# Guardrail: `bun test --coverage` fails if covered lines/functions drop below this.
-coverageThreshold = 0.85
+# Guardrail: `bun test --coverage` (yarn/bun `test:coverage`, and CI) fails if the
+# covered pure-logic modules drop below 100% line coverage. Coverage only spans files
+# reachable from tests, so the React Native UI, the useCast hook, native-module
+# bridges, and real-I/O servers — which aren't unit-testable and are verified
+# on-device / e2e — don't count against it. Function % is floored a hair under 100
+# because Bun's function counter misses some always-executed closures even at 100%
+# line coverage.
+coverageThreshold = { line = 1.0, function = 0.95 }
 coverageSkipTestFiles = true

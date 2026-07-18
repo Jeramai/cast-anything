@@ -207,3 +207,18 @@ describe('repeat cycle contract', () => {
     expect(nextRepeat('one')).toBe('off');
   });
 });
+
+describe('retreat from an unstarted / fully-blocked queue', () => {
+  test('unstarted queue (current -1) returns the first item', () => {
+    expect(retreat(state({ length: 3, current: -1 }))).toBe(0);
+  });
+  test('unstarted with the front blocked returns the first playable', () => {
+    expect(retreat(state({ length: 3, current: -1, blocked: new Set([0]) }))).toBe(1);
+  });
+  test('unstarted with everything blocked returns null', () => {
+    expect(retreat(state({ length: 3, current: -1, blocked: new Set([0, 1, 2]) }))).toBeNull();
+  });
+  test('repeat-all with everything blocked returns null (no infinite loop)', () => {
+    expect(retreat(state({ length: 3, current: 1, repeat: 'all', blocked: new Set([0, 1, 2]) }))).toBeNull();
+  });
+});

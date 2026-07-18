@@ -205,3 +205,18 @@ describe("buildConvertArgs", () => {
     );
   });
 });
+
+describe("resolutionLabel via assessForCast", () => {
+  test("labels a sub-4K high-res source by its height in the downscale reason", () => {
+    const a = assessForCast({
+      container: "matroska,webm",
+      videoCodec: "hevc",
+      audioCodec: "aac",
+      durationSec: 100,
+      width: 2560,
+      height: 1440,
+    });
+    expect(a.downscale).toBe(true);
+    expect(a.reason).toContain("1440p");
+  });
+});

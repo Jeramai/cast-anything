@@ -125,3 +125,12 @@ describe("fetchDevice", () => {
     expect(await fetchDevice(hit())).toBeNull();
   });
 });
+
+describe("fetchDevice — malformed description XML", () => {
+  test("returns null when the description makes the XML parser throw", async () => {
+    // An unclosed processing instruction throws in fast-xml-parser ("Pi Tag is not
+    // closed") → the parse try/catch returns null rather than crashing discovery.
+    mockFetch("<?xml");
+    expect(await fetchDevice(hit())).toBeNull();
+  });
+});

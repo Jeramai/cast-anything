@@ -144,3 +144,10 @@ describe("mediaItemFromSafUri", () => {
     expect(mediaItemFromSafUri(uri("primary:M/poster.png"))?.kind).toBe("image");
   });
 });
+
+describe("fileNameFromSafUri — malformed input", () => {
+  test("returns null when the uri has an invalid percent-encoding", () => {
+    // %E0%A4%A is a truncated UTF-8 sequence → decodeURIComponent throws → null.
+    expect(fileNameFromSafUri("content://x/document/%E0%A4%A")).toBeNull();
+  });
+});

@@ -219,3 +219,67 @@ describe("castMedia", () => {
     ).rejects.toThrow(/714/);
   });
 });
+
+describe("no AVTransport service", () => {
+  test("play() rejects when the device has no AVTransport control URL", async () => {
+    const noAv = { friendlyName: "X" } as unknown as DlnaDevice;
+    await expect(play(noAv)).rejects.toThrow(/no AVTransport/);
+  });
+});
+
+describe("fault without a description", () => {
+  test("falls back to the built-in hint for a bare error code", async () => {
+    // errorDescription is empty → the message uses UPNP_ERRORS[code] instead.
+    setFetch(() => res(fault(701, ""), false, 500));
+    await expect(getTransportInfo(dev)).rejects.toThrow(/Transition not available/);
+  });
+});
+
+describe("post-cast diagnostic (inspectDevice)", () => {
+  test("on a non-701 Play failure it rethrows AND runs the SCPD diagnostic", async () => {
+    setFetch((url, opts) => {
+      if (String(url).includes("scpd")) {
+        return res(
+          "<scpd><actionList>" +
+            "<action><name>SetAVTransportURI</name></action>" +
+            "<action><name>Play</name></action>" +
+            "</actionList></scpd>",
+        );
+      }
+      if (action(opts).includes("GetTransportInfo")) {
+        return res(
+          envelope(
+            '<u:GetTransportInfoResponse xmlns:u="x">' +
+              "<CurrentTransportState>STOPPED</CurrentTransportState>" +
+              "<CurrentTransportStatus>OK</CurrentTransportStatus></u:GetTransportInfoResponse>",
+          ),
+        );
+      }
+      // Play fails with a non-701 fault → castMedia's Play catch rethrows (not the
+      // 701-tolerate branch) → outer catch fires inspectDevice fire-and-forget.
+      if (action(opts).includes("#Play")) return res(fault(714, "Unsupported"), false, 500);
+      return res(okEmpty()); // SetAVTransportURI
+    });
+    await expect(
+      castMedia(dev, { url: "http://h/v.mp4", title: "V", kind: "video", mime: "video/mp4" }),
+    ).rejects.toThrow(/714/);
+    // inspectDevice runs fire-and-forget from the catch — let its detached fetches settle.
+    await new Promise((r) => setTimeout(r, 40));
+  });
+});
+
+describe("post-cast diagnostic (inspectDevice) — inner failures", () => {
+  test("swallows failures of its own GetTransportInfo + SCPD probes", async () => {
+    setFetch((url, opts) => {
+      // Everything the diagnostic touches fails → exercises both its catch blocks.
+      if (String(url).includes("scpd")) throw new Error("network down");
+      if (action(opts).includes("GetTransportInfo")) return res(fault(501, "Action failed"), false, 500);
+      if (action(opts).includes("#Play")) return res(fault(714, "Unsupported"), false, 500);
+      return res(okEmpty()); // SetAVTransportURI
+    });
+    await expect(
+      castMedia(dev, { url: "http://h/v.mp4", title: "V", kind: "video", mime: "video/mp4" }),
+    ).rejects.toThrow(/714/);
+    await new Promise((r) => setTimeout(r, 40));
+  });
+});

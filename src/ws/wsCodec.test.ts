@@ -99,3 +99,19 @@ describe("parseFrames", () => {
     expect(r.consumed).toBe(frame.length);
   });
 });
+
+describe("parseFrames — 64-bit (127) length frames", () => {
+  test("decodes a text frame that uses the 127 extended-length marker", () => {
+    const payload = Buffer.from("hello");
+    const frame = Buffer.from([0x81, 0x7f, 0, 0, 0, 0, 0, 0, 0, payload.length, ...payload]);
+    const r = parseFrames(frame);
+    expect(r.texts).toEqual(["hello"]);
+    expect(r.closed).toBe(false);
+  });
+  test("breaks and consumes nothing when a 127-length frame's 8 length bytes aren't all present", () => {
+    const partial = Buffer.from([0x81, 0x7f, 0, 0, 0]); // only 3 of 8 length bytes
+    const r = parseFrames(partial);
+    expect(r.texts).toEqual([]);
+    expect(r.consumed).toBe(0);
+  });
+});
