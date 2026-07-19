@@ -1,0 +1,36 @@
+Cast Anything turns your phone into a remote for your TV. Pick a video, song, or photo — or paste a link — and it plays on your Samsung TV, or any DLNA-compatible TV or media player, on the same Wi-Fi. No cables, no extra hardware.
+
+WHAT YOU CAN CAST
+• Videos, music and photos from your phone
+• Media links — paste any http/https URL or an .m3u8 live stream
+• A whole folder at once, as a playlist
+
+A REAL REMOTE IN YOUR POCKET
+• Play, pause, stop, skip and seek
+• Volume control
+• Controls on your lock screen and in a notification — keep playing with the screen off
+• A live progress bar, so you always know where you are
+
+PLAYS FILES YOUR TV NORMALLY CAN'T
+• A built-in converter re-encodes HEVC, MKV and 4K on your device into a format your TV can play
+• Pick speed vs. quality, and optionally save the converted copy to your gallery
+
+SUBTITLES
+• Add your own .srt file, or search thousands of subtitles online in 7 languages
+
+QUEUE & PLAYLISTS
+• Line up a whole evening — shuffle, repeat and auto-play across the room
+• Add an entire folder in one tap
+
+MAKE IT YOURS
+• 16 accent colors, plus light, dark and AMOLED themes
+• Swappable app icons
+
+GOOD TO KNOW (please read)
+Cast Anything uses DLNA, the casting standard that Samsung and many other TVs support. That means:
+• It streams files and media links — it does NOT mirror your whole screen. For screen mirroring, use your phone's built-in Smart View / Screen Mirroring.
+• It can't relay DRM-protected apps like Netflix, YouTube or Disney+ — those use their own casting.
+• Your TV still needs to support the file's format (H.264 MP4 plays almost everywhere; the built-in converter helps with the rest).
+• Your phone and the TV must be on the same Wi-Fi network.
+
+Cast Anything is lightweight, ad-free and account-free — it talks directly to your TV on your own network. Just scan, pick, and cast.

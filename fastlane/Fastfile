@@ -21,4 +21,37 @@ platform :android do
       skip_upload_screenshots: true
     )
   end
+
+  desc "Upload the full main store listing (title, descriptions, icon, feature graphic,"
+  desc "phone screenshots) — no binary, no release notes, no track/rollout change."
+  lane :update_listing do
+    upload_to_play_store(
+      json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY"),
+      track: "internal",                 # resolve against the existing vc 5 release
+      skip_upload_aab: true,
+      skip_upload_apk: true,
+      skip_upload_metadata: false,       # title + short/full description
+      skip_upload_changelogs: true,      # leave release notes untouched
+      skip_upload_images: false,         # icon.png + featureGraphic.png
+      skip_upload_screenshots: false     # phoneScreenshots/*
+    )
+  end
+
+  desc "Stage the existing vc 5 build on the Closed testing (alpha) track as a DRAFT,"
+  desc "with release notes. No new binary, internal track untouched, nothing rolled out."
+  lane :closed_testing do
+    upload_to_play_store(
+      json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY"),
+      track: "alpha",                    # Play's "Closed testing" track
+      version_code: 5,                   # release the already-uploaded bundle
+      release_status: "draft",           # stage only; you roll out from the Console
+      deactivate_on_promote: false,      # keep the internal release active
+      skip_upload_aab: true,
+      skip_upload_apk: true,
+      skip_upload_metadata: true,        # listing text already published
+      skip_upload_images: true,
+      skip_upload_screenshots: true,
+      skip_upload_changelogs: false      # attach changelogs/5.txt as the release notes
+    )
+  end
 end
