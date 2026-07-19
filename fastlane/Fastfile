@@ -37,14 +37,14 @@ platform :android do
     )
   end
 
-  desc "Stage the existing vc 5 build on the Closed testing (alpha) track as a DRAFT,"
-  desc "with release notes. No new binary, internal track untouched, nothing rolled out."
+  desc "Roll out the existing vc 5 build to the Closed testing (alpha) track,"
+  desc "with release notes. No new binary; the internal track stays active."
   lane :closed_testing do
     upload_to_play_store(
       json_key: ENV.fetch("GOOGLE_PLAY_JSON_KEY"),
       track: "alpha",                    # Play's "Closed testing" track
       version_code: 5,                   # release the already-uploaded bundle
-      release_status: "draft",           # stage only; you roll out from the Console
+      release_status: "completed",       # roll out live to the track's testers
       deactivate_on_promote: false,      # keep the internal release active
       skip_upload_aab: true,
       skip_upload_apk: true,
