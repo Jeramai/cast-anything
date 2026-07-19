@@ -70,3 +70,7 @@ modules/**/.gradle/
 *.aab
 *.apk
 coverage/
+
+# Rendered Play screenshots — regenerable via store-screenshots/render.sh, and
+# byte-identical to the tracked copies under fastlane/metadata/.../images.
+store-screenshots/out/

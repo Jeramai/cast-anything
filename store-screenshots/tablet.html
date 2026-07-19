@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Cast Anything — Play tablet screenshots</title>
+    <style>
+      /* Landscape tablet slides. Authored at 1280×800; render at 2× → 2560×1600
+         (ratio 1.6:1, well within Play's 2:1 limit). Reuses the phone captures in
+         ./shots. Same set is fine for both the 7" and 10" tablet slots. */
+      :root {
+        --bg-0: #070a11; --bg-1: #0d1320;
+        --ink: #f5f8fe; --ink-dim: #9aa8be; --accent: #4f8cff; --frame: #04060a;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body { background: #04060a; }
+      body {
+        font-family: "Helvetica Neue", "Inter", "Segoe UI", Arial, sans-serif;
+        -webkit-font-smoothing: antialiased;
+        display: flex; flex-wrap: wrap; gap: 32px; padding: 32px; justify-content: center;
+      }
+      .slide {
+        position: relative; width: 1280px; height: 800px; overflow: hidden;
+        display: flex; align-items: center; gap: 48px; padding: 0 88px;
+        background:
+          radial-gradient(900px 900px at var(--glow-x, 74%) 50%, rgba(79,140,255,0.30), transparent 62%),
+          linear-gradient(120deg, var(--bg-1) 0%, var(--bg-0) 70%);
+        color: var(--ink);
+      }
+      .slide::before {
+        content: ""; position: absolute; inset: 0 0 auto 0; height: 3px;
+        background: linear-gradient(90deg, transparent, rgba(79,140,255,0.55), transparent); opacity: .6;
+      }
+      .copy { flex: 1 1 0; z-index: 3; }
+      .brand { display: flex; align-items: center; gap: 16px; margin-bottom: 30px; }
+      .brand img { width: 60px; height: 60px; border-radius: 15px; box-shadow: 0 8px 22px rgba(0,0,0,.5); }
+      .brand span { font-size: 30px; font-weight: 700; letter-spacing: -0.5px; color: #dbe6f7; }
+      .eyebrow { font-size: 23px; font-weight: 800; letter-spacing: 4px; text-transform: uppercase;
+        color: var(--accent); margin-bottom: 20px; }
+      h1 { font-size: 76px; font-weight: 800; line-height: 1.02; letter-spacing: -2px;
+        white-space: pre-line; text-shadow: 0 2px 24px rgba(0,0,0,.35); }
+      .sub { margin-top: 24px; font-size: 31px; font-weight: 500; line-height: 1.34;
+        color: var(--ink-dim); max-width: 560px; }
+      .stage { flex: 0 0 auto; display: flex; align-items: center; justify-content: center; z-index: 2; }
+      .phone { width: 326px; padding: 12px; background: var(--frame); border-radius: 42px;
+        box-shadow: 0 0 0 1px rgba(255,255,255,.06), 0 40px 100px rgba(0,0,0,.6), 0 24px 70px rgba(79,140,255,.2); }
+      .phone .screen { border-radius: 33px; overflow: hidden; line-height: 0;
+        box-shadow: inset 0 0 0 1px rgba(255,255,255,.04); }
+      .phone .screen img { width: 100%; display: block; }
+
+      /* even slides: copy on the right, phone on the left */
+      .slide.flip { flex-direction: row-reverse; --glow-x: 26%; }
+      .phone.tilt-r { transform: rotate(-4deg); }
+      .phone.tilt-l { transform: rotate(4deg); }
+
+      body.shot { padding: 0; gap: 0; background: transparent; display: block; }
+      body.shot .slide { display: none; }
+      body.shot .slide.target { display: flex; position: fixed; top: 0; left: 0; }
+      .caption { position: absolute; top: -30px; left: 0; font: 600 20px/1 "Helvetica Neue", Arial, sans-serif; color: #6b7688; }
+      .frame-wrap { position: relative; }
+    </style>
+  </head>
+  <body>
+    <div id="deck"></div>
+    <script>
+      const SLIDES = [
+        { id: 1, eyebrow: "Cast to any TV", headline: "Your phone.\nYour TV.\nNo cables.",
+          sub: "Cast video, music & photos to any TV on your Wi‑Fi. No Chromecast required.",
+          shot: "./shots/01-hero.png", tilt: "r", flip: false },
+        { id: 2, eyebrow: "Full control", headline: "A full remote,\nin your pocket.",
+          sub: "Play, pause, skip and seek — with volume — right from your phone. Even screen‑off.",
+          shot: "./shots/02-nowplaying.png", tilt: "l", flip: true },
+        { id: 3, eyebrow: "Convert", headline: "Any file plays.\nWe convert it.",
+          sub: "HEVC, MKV, 4K — transcoded on‑device into something your TV can actually play.",
+          shot: "./shots/03-convert.png", tilt: "r", flip: false },
+        { id: 4, eyebrow: "Subtitles", headline: "Subtitles,\nsorted.",
+          sub: "Attach your own .srt, or search thousands online in seven languages.",
+          shot: "./shots/04-subs.png", tilt: "l", flip: true },
+        { id: 5, eyebrow: "Queue", headline: "Line up\nthe whole night.",
+          sub: "Build a playlist. Shuffle, repeat and auto‑play across the room.",
+          shot: "./shots/05-queue.png", tilt: "r", flip: false },
+        { id: 6, eyebrow: "Make it yours", headline: "Themes for\nevery mood.",
+          sub: "16 accent colors, light · dark · AMOLED, and swappable app icons.",
+          shot: "./shots/06-themes.png", tilt: "l", flip: true },
+      ];
+      const slideHTML = (s) => `
+        <div class="frame-wrap">
+          <div class="caption">Tablet ${s.id} · 2560×1600</div>
+          <section class="slide ${s.flip ? "flip" : ""}" id="shot-${s.id}">
+            <div class="copy">
+              <div class="brand"><img src="./shots/app-icon.png" alt=""><span>Cast Anything</span></div>
+              <div class="eyebrow">${s.eyebrow}</div>
+              <h1>${s.headline}</h1>
+              <div class="sub">${s.sub}</div>
+            </div>
+            <div class="stage"><div class="phone tilt-${s.tilt}"><div class="screen"><img src="${s.shot}" alt=""></div></div></div>
+          </section>
+        </div>`;
+      document.getElementById("deck").innerHTML = SLIDES.map(slideHTML).join("");
+      function applyHash() {
+        const m = location.hash.match(/shot-(\d+)/);
+        document.querySelectorAll(".slide").forEach((el) => el.classList.remove("target"));
+        if (m) { document.body.classList.add("shot"); const el = document.getElementById("shot-" + m[1]); if (el) el.classList.add("target"); }
+        else document.body.classList.remove("shot");
+      }
+      window.addEventListener("hashchange", applyHash);
+      applyHash();
+    </script>
+  </body>
+</html>
